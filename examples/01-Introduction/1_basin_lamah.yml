@@ -1,12 +1,12 @@
 # --- Experiment configurations --------------------------------------------------------------------
 
 # experiment name, used as folder name
-experiment_name: test_run_cl
+experiment_name: test_run_lamah
 
 # files to specify training, validation and test basins (relative to code root or absolute path)
-train_basin_file: 1_basin_cl.txt
-validation_basin_file: 1_basin_cl.txt
-test_basin_file: 1_basin_cl.txt
+train_basin_file: 1_basin_lamah.txt
+validation_basin_file: 1_basin_lamah.txt
+test_basin_file: 1_basin_lamah.txt
 
 # training, validation and test time periods (format = 'dd/mm/yyyy')
 train_start_date: "12/01/2009"
@@ -105,10 +105,10 @@ save_weights_every: 1
 # --- Data configurations --------------------------------------------------------------------------
 
 # which data set to use [camels_us, camels_gb, global, hourly_camels_us]
-dataset: camels_cl
+dataset: lamah_a
 
 # Path to data set root
-data_dir: ../../data/CAMELS_CL_v202201
+data_dir: ../../data/1_LamaH-CE_daily_hourly
 
 # Forcing product [daymet, maurer, maurer_extended, nldas, nldas_extended, nldas_hourly]
 # can be either a list of forcings or a single forcing product
@@ -118,17 +118,33 @@ forcings:
   - nldas
 
 dynamic_inputs:
-  - tmax_cr2met_C
-  - pet_hargreaves_mm
-  - precip_mswep_mm
-  - tmean_cr2met_C
-  - tmin_cr2met_C
-  - precip_cr2met_mm
+  - DOY
+  - 2m_temp_max
+  - 2m_temp_mean
+  - 2m_temp_min
+  - 2m_dp_temp_max
+  - 2m_dp_temp_mean
+  - 2m_dp_temp_min
+  - 10m_wind_u
+  - 10m_wind_v
+  - fcst_alb
+  - lai_high_veg
+  - lai_low_veg
+  - swe
+  - surf_net_solar_rad_max
+  - surf_net_solar_rad_mean
+  - surf_net_therm_rad_max
+  - surf_net_therm_rad_mean
+  - surf_press
+  - total_et
+  - prec
+  - volsw_123
+  - volsw_4
 
 # which columns to use as target
 target_variables:
-  - q_mm
+  - qobs
 
 # clip negative predictions to zero for all variables listed below. Should be a list, even for single variables.
 clip_targets_to_zero:
-  - q_mm
+  - qobs
