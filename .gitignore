@@ -2,6 +2,8 @@
 **/*.pyc
 **/*.h5
 **/*.p
+**/*.png
+**/*.pt
 !test/test_data/*.p
 *.swp
 .coverage
