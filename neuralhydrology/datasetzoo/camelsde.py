@@ -110,7 +110,7 @@ def load_camels_de_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
         raise FileNotFoundError("".join(msg))
         
     # load the data for the specific basin into a time-indexed dataframe
-    basin_file = preprocessed_dir / f"CAMELS_DE_hydromet_timeseries_DE{basin}.csv"
+    basin_file = preprocessed_dir / f"CAMELS_DE_hydromet_timeseries_{basin}.csv"
     df = pd.read_csv(basin_file, index_col='date', parse_dates=['date'])
     return df
 
