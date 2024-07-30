@@ -4,6 +4,7 @@ from neuralhydrology.datasetzoo.camelsbr import CamelsBR
 from neuralhydrology.datasetzoo.camelscl import CamelsCL
 from neuralhydrology.datasetzoo.camelsgb import CamelsGB
 from neuralhydrology.datasetzoo.camelsus import CamelsUS
+from neuralhydrology.datasetzoo.camelsde import CamelsDE
 from neuralhydrology.datasetzoo.caravan import Caravan
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
 from neuralhydrology.datasetzoo.hourlycamelsus import HourlyCamelsUS
@@ -71,6 +72,8 @@ def get_dataset(cfg: Config,
         Dataset = HourlyCamelsUS
     elif cfg.dataset.lower() == "camels_cl":
         Dataset = CamelsCL
+    elif cfg.dataset == "camels_de":
+        Dataset = CamelsDE
     elif cfg.dataset.lower() == "generic":
         Dataset = GenericDataset
     elif cfg.dataset.lower() in ["lamah_a", "lamah_b", "lamah_c"]:
