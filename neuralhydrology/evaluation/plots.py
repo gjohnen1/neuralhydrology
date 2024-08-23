@@ -4,6 +4,8 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 
+import numpy as np
+import plotly.graph_objects as go
 
 def percentile_plot(y: np.ndarray,
                     y_hat: np.ndarray,
@@ -40,11 +42,84 @@ def percentile_plot(y: np.ndarray,
     ax.fill_between(x, y_10, y_90, color='#31688E', label='10-90 PI')
     ax.fill_between(x, y_25, y_75, color="#440154", label='25-75 PI')
     ax.plot(y_median, '-', color='red', label="median")
-    ax.plot(y.flatten(), '--', color='black', label="observed")
+    ax.plot(y, '--', color='black', label="observed")
     ax.legend()
     ax.set_title(title)
 
     return fig, ax
+
+
+def percentile_plot_plotly(y: np.ndarray, y_hat: np.ndarray, title: str = ''):
+    """Plot the time series of observed values with 3 specific prediction intervals (i.e.: 25 to 75, 10 to 90, 5 to 95) using Plotly.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Array of observed values.
+    y_hat : np.ndarray
+        Array of simulated values, where the last dimension contains the samples for each time step.
+    title : str, optional
+        Title of the plot.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        The percentile plot.
+    """
+    y_median = np.median(y_hat, axis=-1).flatten()
+    y_25 = np.percentile(y_hat, 25, axis=-1).flatten()
+    y_75 = np.percentile(y_hat, 75, axis=-1).flatten()
+    y_10 = np.percentile(y_hat, 10, axis=-1).flatten()
+    y_90 = np.percentile(y_hat, 90, axis=-1).flatten()
+    y_05 = np.percentile(y_hat, 5, axis=-1).flatten()
+    y_95 = np.percentile(y_hat, 95, axis=-1).flatten()
+
+    x = y['date']
+
+    fig = go.Figure()
+
+    # Add the fill between intervals
+    fig.add_trace(go.Scatter(
+        x=x, y=y_95, fill=None, mode='lines', line_color='rgba(53, 183, 121, 0.4)', name='05-95 PI'
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=y_05, fill='tonexty', mode='lines', line_color='rgba(53, 183, 121, 0.4)', showlegend=False
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=x, y=y_90, fill=None, mode='lines', line_color='rgba(49, 104, 142, 0.4)', name='10-90 PI'
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=y_10, fill='tonexty', mode='lines', line_color='rgba(49, 104, 142, 0.4)', showlegend=False
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=x, y=y_75, fill=None, mode='lines', line_color='rgba(68, 1, 84, 0.4)', name='25-75 PI'
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=y_25, fill='tonexty', mode='lines', line_color='rgba(68, 1, 84, 0.4)', showlegend=False
+    ))
+
+    # Add the median line
+    fig.add_trace(go.Scatter(
+        x=x, y=y_median, mode='lines', line=dict(color='red'), name='median'
+    ))
+
+    # Add the observed values line
+    fig.add_trace(go.Scatter(
+        x=x, y=y[:, 0], mode='lines', line=dict(color='black', dash='dot'), name='observed'
+    ))
+
+    # Update layout
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time",
+        yaxis_title="Discharge (m³/s)",
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+        template="plotly_white"
+    )
+
+    return fig
 
 
 def regression_plot(y: np.ndarray,

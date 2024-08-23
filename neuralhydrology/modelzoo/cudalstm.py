@@ -34,7 +34,7 @@ class CudaLSTM(BaseModel):
 
         self.embedding_net = InputLayer(cfg)
 
-        self.lstm = nn.LSTM(input_size=self.embedding_net.output_size, hidden_size=cfg.hidden_size)
+        self.lstm = nn.LSTM(input_size=self.embedding_net.output_size, num_layers=cfg.num_layers, hidden_size=cfg.hidden_size)
 
         self.dropout = nn.Dropout(p=cfg.output_dropout)
 
