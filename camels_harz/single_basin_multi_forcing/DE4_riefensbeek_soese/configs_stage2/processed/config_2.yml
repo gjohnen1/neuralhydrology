@@ -29,6 +29,7 @@ loss: MSE
 metrics:
 - NSE
 model: cudalstm
+num_layers: 1
 num_workers: 8
 optimizer: Adam
 output_activation: linear

@@ -43,9 +43,9 @@ save_validation_results: True
 model: cudalstm
 
 # prediction head [regression]. Define the head specific parameters below
-head: gmm
+head: cmal
 
-# ----> GMM settings <----
+# ----> CMAL settings <----
 
 # number of components
 n_distributions: 3
@@ -76,7 +76,7 @@ output_dropout: 0.4 # 40% dropout in the linear output layer
 optimizer: Adam
 
 # specify loss [MSE, NSE, RMSE]
-loss: GMMLoss
+loss: CMALLoss
 
 # specify learning rates to use starting at specific epochs (0 is the initial learning rate)
 learning_rate: 0.001
@@ -85,7 +85,7 @@ learning_rate: 0.001
 batch_size: 32
 
 # Number of training epochs
-epochs: 50
+epochs: 20
 
 # If a value, clips the gradients during training to that norm.
 clip_gradient_norm: 1
