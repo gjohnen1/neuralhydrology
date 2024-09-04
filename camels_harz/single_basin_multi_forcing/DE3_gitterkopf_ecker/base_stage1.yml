@@ -50,6 +50,9 @@ output_activation: linear
 
 # ----> General settings <----
 
+# Number of LSTM layers
+num_layers: 1
+
 # Number of cell states of the LSTM
 hidden_size: 20
 
