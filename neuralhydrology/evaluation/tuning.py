@@ -108,7 +108,7 @@ def get_best_model_per_seed(parent_dir, seeds, grid_params, run_patterns):
     
     return best_models_per_seed
 
-def get_best_model_per_seed(parent_dir, grid_params, run_patterns):
+def get_best_model(parent_dir, grid_params, run_patterns):
     """
     Get the best model based on the highest median NSE score.
 
