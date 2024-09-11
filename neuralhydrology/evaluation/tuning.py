@@ -23,7 +23,10 @@ def generate_run_dir_patterns(grid, experiment_name):
     
     for experiment in experiments:
         parts = [f"{key}{value}" for key, value in experiment.items() if key != 'seed']
-        dir_pattern = f"{experiment_name}_" + "_".join(parts) + f"_seed{experiment['seed']}_*"
+        if 'seed' in keys:
+            dir_pattern = f"{experiment_name}_" + "_".join(parts) + f"_seed{experiment['seed']}_*"
+        else:
+            dir_pattern = f"{experiment_name}_" + "_".join(parts) + "_*"
         run_dir_patterns.append(dir_pattern)
     
     return run_dir_patterns
@@ -104,3 +107,71 @@ def get_best_model_per_seed(parent_dir, seeds, grid_params, run_patterns):
     print('Finished.')
     
     return best_models_per_seed
+
+def get_best_model(parent_dir, grid_params, run_patterns):
+    """
+    Get the best model based on the highest median NSE score.
+
+    Args:
+        parent_dir (str): Parent directory containing the model run directories.
+        grid_params (list): List of grid parameters.
+        run_patterns (list, optional): List of run directory patterns. Defaults to None.
+
+    Returns:
+        dict: Dictionary containing the best model directory, best NSE score, best epoch, and best model config.
+    """
+    best_model = None
+    best_nse = -float('inf')
+    best_model_config = None
+    best_epoch = None
+
+    # Get full run directories based on the run directory patterns
+    run_dirs = []
+    for run_pattern in run_patterns:
+        run_dirs.extend(Path(parent_dir).rglob(run_pattern))
+
+    # Iterate over each run directory
+    for model_dir in run_dirs:
+        model_path = str(model_dir)
+        config_path = os.path.join(model_path, 'config.yml')
+        validation_path = os.path.join(model_path, 'validation')
+
+        if os.path.exists(config_path) and os.path.exists(validation_path):
+            # Read the config file
+            with open(config_path, 'r') as file:
+                config = yaml.safe_load(file)
+
+            # Collect all NSE scores across all epochs
+            nse_scores = []
+
+            # Get the list of epoch directories and sort them
+            epoch_dirs = sorted(os.listdir(validation_path))
+
+            # Iterate through all validation epochs
+            for epoch_dir in epoch_dirs:
+                validation_metrics_path = os.path.join(validation_path, epoch_dir, 'validation_metrics.csv')
+                if os.path.exists(validation_metrics_path):
+                    # Read the validation metrics file
+                    metrics_df = pd.read_csv(validation_metrics_path)
+                    nse_scores.extend(metrics_df['NSE'].tolist())
+            
+            # Find the best epoch
+            if nse_scores:
+                best_epoch_idx = np.argmax(nse_scores)
+                best_epoch = epoch_dirs[best_epoch_idx]  # Best epoch directory name
+
+                # Get the highest median NSE score across all epochs
+                median_nse = pd.Series(nse_scores).median()
+
+                # Check if this is the best NSE score overall
+                if median_nse > best_nse:
+                    best_nse = median_nse
+                    best_model = model_dir
+                    best_model_config = config
+
+    return {
+        'best_model_dir': best_model,
+        'best_nse': best_nse,
+        'best_epoch': best_epoch,
+        'best_model_config': best_model_config
+    }
