@@ -152,8 +152,6 @@ def get_best_model(parent_dir, grid_params, run_patterns):
                     # Read the validation metrics file
                     metrics_df = pd.read_csv(validation_metrics_path)
                     nse_scores.extend(metrics_df['NSE'].tolist())
-            # find the best epoch
-            best_epoch = np.argmax(nse_scores)
             
             # Get the highest median NSE score across all epochs
             if nse_scores:
@@ -162,6 +160,7 @@ def get_best_model(parent_dir, grid_params, run_patterns):
                 # Check if this is the best NSE score for the current seed
                 if median_nse > best_median_nse:
                     best_median_nse = median_nse
+                    best_epoch = (np.argmax(nse_scores)+1)*config['validate_every']
                     best_model = model_dir
                     best_model_config = config
     
