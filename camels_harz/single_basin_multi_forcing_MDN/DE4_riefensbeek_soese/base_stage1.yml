@@ -17,7 +17,7 @@ test_start_date: "01/10/2018"
 test_end_date: "31/12/2020"
 
 # fixed seed, leave empty to use a random seed
-seed: 
+seed: 32
 
 # which GPU (id) to use [in format of cuda:0, cuda:1 etc, or cpu or None]
 device: cuda:0
@@ -59,16 +59,19 @@ negative_sample_handling: clip
 # ----> General settings <----
 
 # Number of layers of the LSTM
-num_layers: 2
+num_layers: 1
 
 # Number of cell states of the LSTM
-hidden_size: 64
+hidden_size: 256
 
 # Initial bias value of the forget gate
 initial_forget_bias: 3
 
+# The amount of relative noise of the output
+target_noise_std: 0.2
+
 # Dropout applied to the output of the LSTM
-output_dropout: 0.4 # 40% dropout in the linear output layer
+output_dropout: 0.5 # 20% dropout in the linear output layer
 
 # --- Training configuration -----------------------------------------------------------------------
 
@@ -79,13 +82,13 @@ optimizer: Adam
 loss: CMALLoss
 
 # specify learning rates to use starting at specific epochs (0 is the initial learning rate)
-learning_rate: 0.001
+learning_rate: 0.005
 
 # Mini-batch size
-batch_size: 32
+batch_size: 256
 
 # Number of training epochs
-epochs: 20
+epochs: 100
 
 # If a value, clips the gradients during training to that norm.
 clip_gradient_norm: 1
