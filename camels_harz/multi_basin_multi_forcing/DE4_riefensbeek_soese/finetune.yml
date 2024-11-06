@@ -1,0 +1,27 @@
+# --- Experiment configurations --------------------------------------------------------------------
+
+# experiment name, used as folder name
+experiment_name: cudalstm_750_basins_finetuned
+
+# files to specify training, validation and test basins (relative to code root or absolute path)
+train_basin_file: finetune_basin.txt
+validation_basin_file: finetune_basin.txt
+test_basin_file: finetune_basin.txt
+
+
+# --- Validation configuration ---------------------------------------------------------------------
+
+# specify after how many epochs to perform validation
+validate_every: 4
+
+# --- Training configuration -----------------------------------------------------------------------
+
+# specify learning rates to use starting at specific epochs (0 is the initial learning rate)
+learning_rate: 0.0005
+
+# Number of training epochs
+epochs: 30
+
+finetune_modules:
+- head
+- lstm
