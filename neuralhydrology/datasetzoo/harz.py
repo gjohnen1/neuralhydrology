@@ -75,12 +75,12 @@ class Harz(BaseDataset):
 
 
 def load_harz_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
-    """Load the time series data for one basin of the CAMELS CL data set.
+    """Load the time series data for one basin of the Harz.
 
     Parameters
     ----------
     data_dir : Path
-        Path to the CAMELS DE directory. This folder must contain a folder called 'timeseries' containing the 
+        Path to the Harz directory. This folder must contain a folder called 'timeseries' containing the 
         per-basin csv files.
     basin : str
         Basin identifier number as string.
@@ -111,12 +111,12 @@ def load_harz_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
 
 
 def load_harz_attributes(data_dir: Path, basins: List[str] = []) -> pd.DataFrame:
-    """Load CAMELS DE attributes
+    """Load Harz attributes
 
     Parameters
     ----------
     data_dir : Path
-        Path to the CAMELS DE directory. Assumes that a multiple files ending with *_attributes.csv exist.
+        Path to the Harz directory. Assumes that a multiple files ending with *_attributes.csv exist.
     basins : List[str], optional
         If passed, return only attributes for the basins specified in this list. Otherwise, the attributes of all basins
         are returned.
