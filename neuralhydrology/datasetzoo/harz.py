@@ -67,14 +67,14 @@ class Harz(BaseDataset):
 
     def _load_basin_data(self, basin: str) -> pd.DataFrame:
         """Load timeseries data of one specific basin"""
-        return load_camels_de_timeseries(data_dir=self.cfg.data_dir, basin=basin)
+        return load_harz_timeseries(data_dir=self.cfg.data_dir, basin=basin)
 
     def _load_attributes(self) -> pd.DataFrame:
         """Load catchment attributes"""
         return load_harz_attributes(self.cfg.data_dir, basins=self.basins)
 
 
-def load_camels_de_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
+def load_harz_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
     """Load the time series data for one basin of the CAMELS CL data set.
 
     Parameters
