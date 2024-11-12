@@ -12,7 +12,7 @@ from neuralhydrology.utils.config import Config
 
 
 class Harz(BaseDataset):
-    """Data set class for the Harz dataset by [#]_.
+    """Data set class for the Harz data.
 
     For more efficient data loading during model training/evaluating, this dataset class expects the dataset
     in a processed format. Specifically, this dataset class works with per-basin csv files that contain all 
@@ -45,10 +45,6 @@ class Harz(BaseDataset):
 
     References
     ----------
-    .. [#] Dolich, A., Espinoza, E. A., Ebeling, P., Guse, B., Götte, J., Hassler, S., Hauffe, C., Kiesel, J., 
-    Heidbüchel, I., Mälicke, M., Müller-Thomy, H., Stölzle, M., Tarasova, L., & Loritz, R. (2024). CAMELS-DE: 
-    hydrometeorological time series and attributes for 1555 catchments in Germany (0.1.0) [Data set]. Zenodo. 
-    https://doi.org/10.5281/zenodo.12733968
     """
 
     def __init__(self,
@@ -61,7 +57,7 @@ class Harz(BaseDataset):
                  scaler: Dict[str, Union[pd.Series, xarray.DataArray]] = {}):
         
         # Initialize `BaseDataset` class
-        super(CamelsDE, self).__init__(cfg=cfg,
+        super(Harz, self).__init__(cfg=cfg,
                                        is_train=is_train,
                                        period=period,
                                        basin=basin,
@@ -75,7 +71,7 @@ class Harz(BaseDataset):
 
     def _load_attributes(self) -> pd.DataFrame:
         """Load catchment attributes"""
-        return load_camels_de_attributes(self.cfg.data_dir, basins=self.basins)
+        return load_harz_attributes(self.cfg.data_dir, basins=self.basins)
 
 
 def load_camels_de_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
@@ -99,7 +95,7 @@ def load_camels_de_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
     FileNotFoundError
         If no sub-folder called 'timeseries' exists within the root directory of the CAMELS DE dataset.
     """
-    preprocessed_dir = data_dir / "timeseries"
+    preprocessed_dir = data_dir / "timeseries/hourly"
     
     # make sure the CAMELS-CL data was already preprocessed and per-basin files exist.
     if not preprocessed_dir.is_dir():
@@ -109,12 +105,12 @@ def load_camels_de_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
         raise FileNotFoundError("".join(msg))
         
     # load the data for the specific basin into a time-indexed dataframe
-    basin_file = preprocessed_dir / f"CAMELS_DE_hydromet_timeseries_{basin}.csv"
+    basin_file = preprocessed_dir / f"hydromet_timeseries_{basin}.csv"
     df = pd.read_csv(basin_file, index_col='date', parse_dates=['date'])
     return df
 
 
-def load_camels_de_attributes(data_dir: Path, basins: List[str] = []) -> pd.DataFrame:
+def load_harz_attributes(data_dir: Path, basins: List[str] = []) -> pd.DataFrame:
     """Load CAMELS DE attributes
 
     Parameters
