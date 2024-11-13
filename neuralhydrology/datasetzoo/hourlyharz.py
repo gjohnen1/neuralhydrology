@@ -11,7 +11,7 @@ from neuralhydrology.datasetzoo.basedataset import BaseDataset
 from neuralhydrology.utils.config import Config
 
 
-class Harz(BaseDataset):
+class HourlyHarz(BaseDataset):
     """Data set class for the Harz data.
 
     For more efficient data loading during model training/evaluating, this dataset class expects the dataset
@@ -57,7 +57,7 @@ class Harz(BaseDataset):
                  scaler: Dict[str, Union[pd.Series, xarray.DataArray]] = {}):
         
         # Initialize `BaseDataset` class
-        super(Harz, self).__init__(cfg=cfg,
+        super(HourlyHarz, self).__init__(cfg=cfg,
                                        is_train=is_train,
                                        period=period,
                                        basin=basin,
@@ -67,14 +67,14 @@ class Harz(BaseDataset):
 
     def _load_basin_data(self, basin: str) -> pd.DataFrame:
         """Load timeseries data of one specific basin"""
-        return load_harz_timeseries(data_dir=self.cfg.data_dir, basin=basin)
+        return load_hourly_harz_timeseries(data_dir=self.cfg.data_dir, basin=basin)
 
     def _load_attributes(self) -> pd.DataFrame:
         """Load catchment attributes"""
-        return load_harz_attributes(self.cfg.data_dir, basins=self.basins)
+        return load_hourly_harz_attributes(self.cfg.data_dir, basins=self.basins)
 
 
-def load_harz_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
+def load_hourly_harz_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
     """Load the time series data for one basin of the Harz.
 
     Parameters
@@ -95,7 +95,7 @@ def load_harz_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
     FileNotFoundError
         If no sub-folder called 'timeseries' exists within the root directory of the CAMELS DE dataset.
     """
-    preprocessed_dir = data_dir / "timeseries/hourly"
+    preprocessed_dir = data_dir / "timeseries"
     
     # make sure the CAMELS-CL data was already preprocessed and per-basin files exist.
     if not preprocessed_dir.is_dir():
@@ -110,7 +110,7 @@ def load_harz_timeseries(data_dir: Path, basin: str) -> pd.DataFrame:
     return df
 
 
-def load_harz_attributes(data_dir: Path, basins: List[str] = []) -> pd.DataFrame:
+def load_hourly_harz_attributes(data_dir: Path, basins: List[str] = []) -> pd.DataFrame:
     """Load Harz attributes
 
     Parameters
