@@ -108,7 +108,7 @@ predict_last_n: 1
 
 # Length of the input sequence
 # If use_frequencies is used, this needs to be a dict mapping each frequency to a seq_length, else an int.
-seq_length: 4320
+seq_length: 336
 
 # Number of parallel workers used in the data pipeline
 num_workers: 8
