@@ -111,7 +111,7 @@ save_weights_every: 1
 dataset: camels_de
 
 # Path to data set root
-data_dir: ../../../data/camels_de
+data_dir: ../../../../data/camels_de
 
 dynamic_inputs:
   - precipitation_mean
