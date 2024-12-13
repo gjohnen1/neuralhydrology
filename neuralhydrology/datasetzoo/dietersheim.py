@@ -2,7 +2,8 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 from pathlib import Path
-from forecastdataset import ForecastDataset
+from neuralhydrology.datasetzoo.forecastdataset import ForecastDataset
+from typing import List, Dict, Union
 
 class Dietersheim(ForecastDataset):
     """
@@ -60,14 +61,34 @@ class Dietersheim(ForecastDataset):
         return load_camels_de_attributes(self.cfg.data_dir, basins=self.basins)
     
 
-# Implement data loading from files in separate functions for reusability
-def load_hindcast_features(file_path, horizon, filter_cols=None):
-    with open(file_path, "r") as fp:
-        df = pd.read_csv(filepath_or_buffer=fp, delimiter="\t", index_col="UTC", parse_dates=True)  
-        if filter_cols:
-            df = df[filter_cols]
-                      
-        return df[:-horizon]
+def load_hindcast_features(data_dir: Path, horizon: int, filter_cols=None):
+    """
+    Loads and processes hindcast feature files from a specified directory.
+    
+    Parameters:
+    - data_dir (Path): The directory containing the input files.
+    - horizon (int): Number of rows to exclude from the end of each DataFrame.
+    - filter_cols (list, optional): Columns to filter in the DataFrame.
+    
+    Returns:
+    - xarray.Dataset: Processed dataset with concatenated DataFrames.
+    """
+    files = sorted(data_dir.glob("**/Input*_ptq*"))
+    
+    input_dfs = []
+    for file in files:
+        with open(file, "r") as fp:
+            df = pd.read_csv(filepath_or_buffer=fp, delimiter="\t", index_col="UTC", parse_dates=True)
+            if filter_cols:
+                df = df[filter_cols]
+            input_dfs.append(df[:-horizon])  # Exclude the last 'horizon' rows
+    
+    # Concatenate all DataFrames, taking only the last row from each after the first
+    hindcast_df = pd.concat([input_dfs[0]] + [df[-1:] for df in input_dfs[1:]])
+    hindcast_df.index.name = "date"
+
+    hindcast_xr = xr.Dataset.from_dataframe(hindcast_df.astype(np.float32))
+    return hindcast_xr
     
 def load_forecast_features(file_path, horizon, filter_cols=None):
     with open(file_path, "r") as fp:
