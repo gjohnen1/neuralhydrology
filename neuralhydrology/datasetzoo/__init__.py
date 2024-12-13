@@ -10,6 +10,7 @@ from neuralhydrology.datasetzoo.caravan import Caravan
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
 from neuralhydrology.datasetzoo.hourlycamelsus import HourlyCamelsUS
 from neuralhydrology.datasetzoo.lamah import LamaH
+from neuralhydrology.datasetzoo.dietersheim import Dietersheim
 from neuralhydrology.utils.config import Config
 
 
@@ -79,6 +80,8 @@ def get_dataset(cfg: Config,
         Dataset = HourlyHarz
     elif cfg.dataset.lower() == "generic":
         Dataset = GenericDataset
+    elif cfg.dataset.lower() == "dietersheim":
+        Dataset = Dietersheim
     elif cfg.dataset.lower() in ["lamah_a", "lamah_b", "lamah_c"]:
         Dataset = LamaH
     elif cfg.dataset.lower() == "caravan":
