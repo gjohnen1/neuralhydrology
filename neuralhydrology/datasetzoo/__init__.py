@@ -1,4 +1,5 @@
 from neuralhydrology.datasetzoo.basedataset import BaseDataset
+from neuralhydrology.datasetzoo.forecastdataset import ForecastDataset
 from neuralhydrology.datasetzoo.camelsaus import CamelsAUS
 from neuralhydrology.datasetzoo.camelsbr import CamelsBR
 from neuralhydrology.datasetzoo.camelscl import CamelsCL
