@@ -11,6 +11,7 @@ from neuralhydrology.datasetzoo.camelsde import CamelsDE
 from neuralhydrology.datasetzoo.hourlyharz import HourlyHarz
 from neuralhydrology.datasetzoo.caravan import Caravan
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
+from neuralhydrology.datasetzoo.forecastdataset import ForecastDataset
 from neuralhydrology.datasetzoo.hourlycamelsus import HourlyCamelsUS
 from neuralhydrology.datasetzoo.lamah import LamaH
 from neuralhydrology.datasetzoo.dietersheim import Dietersheim
@@ -68,47 +69,40 @@ def get_dataset(cfg: Config,
     NotImplementedError
         If no data set class is implemented for the 'dataset' argument in the config.
     """
-    global _datasetZooRegistry
+    if cfg.dataset.lower() == "camels_us":
+        Dataset = CamelsUS
+    elif cfg.dataset.lower() == "camels_gb":
+        Dataset = CamelsGB
+    elif cfg.dataset.lower() == "camels_aus":
+        Dataset = CamelsAUS
+    elif cfg.dataset.lower() == "camels_br":
+        Dataset = CamelsBR
+    elif cfg.dataset.lower() == "hourly_camels_us":
+        Dataset = HourlyCamelsUS
+    elif cfg.dataset.lower() == "camels_cl":
+        Dataset = CamelsCL
+    elif cfg.dataset.lower() == "camels_de":
+        Dataset = CamelsDE
+    elif cfg.dataset.lower() == "hourly_harz":
+        Dataset = HourlyHarz
+    elif cfg.dataset.lower() == "generic":
+        Dataset = GenericDataset
+    elif cfg.dataset.lower() == "dietersheim":
+        Dataset = Dietersheim
+    elif cfg.dataset.lower() in ["lamah_a", "lamah_b", "lamah_c"]:
+        Dataset = LamaH
+    elif cfg.dataset.lower() == "caravan":
+        Dataset = Caravan
+    elif cfg.dataset.lower() == "forecast":
+        Dataset = ForecastDataset
+    else:
+        raise NotImplementedError(f"No dataset class implemented for dataset {cfg.dataset}")
 
-    return _datasetZooRegistry.instantiate_dataset(cfg, is_train, period, basin, additional_features, id_to_int, scaler)
-
-
-def register_dataset(key: str, new_class: Type):
-    """Adds a dataset class to the dataset registry.
-    
-    This class must derive from BaseDataset. New dataset class has to be added at the beginning of runtime.
-
-    Parameters
-    ----------
-    key : str
-        The key of the dataset that is set in the configuration file.
-
-    new_class : Type
-        The new Dataset class to register.
-
-    Returns
-    -------
-    None
-
-    Raises
-    ------
-    TypeError
-        If the new class is not derived from BaseDataset.
-    """
-    global _datasetZooRegistry
-    _datasetZooRegistry.register_dataset_class(key, new_class)
-
-
-_datasetZooRegistry: DatasetRegistry = DatasetRegistry()
-
-_datasetZooRegistry.register_dataset_class("camels_us", CamelsUS)
-_datasetZooRegistry.register_dataset_class("camels_gb", CamelsGB)
-_datasetZooRegistry.register_dataset_class("camels_aus", CamelsAUS)
-_datasetZooRegistry.register_dataset_class("camels_br", CamelsBR)
-_datasetZooRegistry.register_dataset_class("hourly_camels_us", HourlyCamelsUS)
-_datasetZooRegistry.register_dataset_class("camels_cl", CamelsCL)
-_datasetZooRegistry.register_dataset_class("generic", GenericDataset)
-_datasetZooRegistry.register_dataset_class("lamah_a", LamaH)
-_datasetZooRegistry.register_dataset_class("lamah_b", LamaH)
-_datasetZooRegistry.register_dataset_class("lamah_c", LamaH)
-_datasetZooRegistry.register_dataset_class("caravan", Caravan)
+    ds = Dataset(cfg=cfg,
+                 is_train=is_train,
+                 period=period,
+                 basin=basin,
+                 additional_features=additional_features,
+                 id_to_int=id_to_int,
+                 scaler=scaler)
+    return ds
