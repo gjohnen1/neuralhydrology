@@ -447,6 +447,10 @@ class Config(object):
     @property
     def hindcast_inputs(self) -> List[str]:
         return self._cfg.get("hindcast_inputs", [])
+    
+    @property
+    def num_layers(self) -> Union[int, Dict[str, int]]:
+        return self._get_value_verbose("num_layers")
 
     @property
     def hidden_size(self) -> Union[int, Dict[str, int]]:
