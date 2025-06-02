@@ -1,3 +1,4 @@
+# CPU-only environment for systems without NVIDIA GPUs or for testing
 name: neuralhydrology
 channels:
   - pytorch
@@ -29,4 +30,3 @@ dependencies:
     - sphinx-rtd-theme
     - nbsphinx
     - nbsphinx-link
-    - parso==0.8.0
