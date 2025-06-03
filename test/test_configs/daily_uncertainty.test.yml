@@ -1,7 +1,7 @@
 # --- Experiment configurations --------------------------------------------------------------------
 experiment_name: test_run
 
-run_dir:
+run_dir: ./test/test_runs/
 
 train_basin_file: ./test/test_data/4_basins_test_set.txt
 validation_basin_file: ./test/test_data/4_basins_test_set.txt
@@ -28,23 +28,29 @@ metrics:
   - Beta-NSE
 
 # --- Model configuration --------------------------------------------------------------------------
-model: mtslstm
-head: regression
+model: cudalstm
+head: # to be filled by conftest
 output_activation: linear
+
+# Model parameters for CMAL head
+n_distributions: # to be filled by conftest
+n_samples: # to be filled by conftest
+negative_sample_handling: # to be filled by conftest
+negative_sample_max_retries: # to be filled by conftest
+mc_dropout: # to be filled by conftest
+
+# Model parameters for UMAL head
+n_taus: # to be filled by conftest
+tau_down: # to be filled by conftest
+tau_up: # to be filled by conftest
 
 hidden_size: 16
 initial_forget_bias: 3
 output_dropout: 0.4
 
-ode_method: euler
-ode_num_unfolds: 4
-ode_random_freq_lower_bound: 5D
-
 # --- Training configuration -----------------------------------------------------------------------
 optimizer: Adam
 loss: MSE
-regularization:
-  - tie_frequencies
 learning_rate:
   0: 1e-3
   10: 5e-4
@@ -53,15 +59,8 @@ batch_size: 256
 epochs: 1
 clip_gradient_norm: 1
 
-use_frequencies:
-  - 1D
-  - 1h
-predict_last_n:
-  1D: 1
-  1h: 24
-seq_length:
-  1D: 30
-  1h: 48
+predict_last_n: 1
+seq_length: 30
 
 num_workers: 0
 log_interval: 5
@@ -71,14 +70,12 @@ save_weights_every: 1
 save_validation_results: False
 
 # --- Data configurations --------------------------------------------------------------------------
-dataset: hourly_camels_us
-data_dir: ./test/test_data/camels_us
-forcings: nldas_hourly
-dynamic_inputs:
-  - total_precipitation
-  - temperature
+dataset: # will be filled by conftest
+data_dir: ./test/test_data
+forcings: # will be filled by conftest
+dynamic_inputs: # will be filled by conftest
 target_variables:
-  - qobs_mm_per_hour
+  - QObs(mm/d)
 static_attributes:
   - elev_mean
   - slope_mean

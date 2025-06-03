@@ -1,3 +1,5 @@
+from typing import Type
+
 from neuralhydrology.datasetzoo.basedataset import BaseDataset
 from neuralhydrology.datasetzoo.forecastdataset import ForecastDataset
 from neuralhydrology.datasetzoo.camelsaus import CamelsAUS
@@ -14,6 +16,7 @@ from neuralhydrology.datasetzoo.hourlycamelsus import HourlyCamelsUS
 from neuralhydrology.datasetzoo.lamah import LamaH
 from neuralhydrology.datasetzoo.dietersheim import Dietersheim
 from neuralhydrology.utils.config import Config
+from neuralhydrology.datasetzoo.datasetregistry import DatasetRegistry
 
 
 def get_dataset(cfg: Config,
@@ -25,19 +28,21 @@ def get_dataset(cfg: Config,
                 scaler: dict = {}) -> BaseDataset:
     """Get data set instance, depending on the run configuration.
 
-    Currently implemented datasets are 'caravan', 'camels_aus', 'camels_br', 'camels_cl', 'camels_gb', 'camels_us', and 
+    Currently implemented datasets are 'caravan', 'camels_aus', 'camels_br', 'camels_cl', 'camels_gb', 'camels_us', and
     'hourly_camels_us', as well as the 'generic' dataset class that can be used for any kind of dataset as long as it is
     in the correct format.
+
+    New dataset classes can be added at the beginning of runtime using the function register_dataset().
 
     Parameters
     ----------
     cfg : Config
         The run configuration.
-    is_train : bool 
+    is_train : bool
         Defines if the dataset is used for training or evaluating. If True (training), means/stds for each feature
-        are computed and stored to the run directory. If one-hot encoding is used, the mapping for the one-hot encoding 
+        are computed and stored to the run directory. If one-hot encoding is used, the mapping for the one-hot encoding
         is created and also stored to disk. If False, a `scaler` input is expected and similarly the `id_to_int` input
-        if one-hot encoding is used. 
+        if one-hot encoding is used.
     period : {'train', 'validation', 'test'}
         Defines the period for which the data will be loaded
     basin : str, optional
@@ -48,7 +53,7 @@ def get_dataset(cfg: Config,
         loaded from the dataset and all columns are available as 'dynamic_inputs', 'evolving_attributes' and
         'target_variables'
     id_to_int : Dict[str, int], optional
-        If the config argument 'use_basin_id_encoding' is True in the config and period is either 'validation' or 
+        If the config argument 'use_basin_id_encoding' is True in the config and period is either 'validation' or
         'test', this input is required. It is a dictionary, mapping from basin id to an integer (the one-hot encoding).
     scaler : Dict[str, Union[pd.Series, xarray.DataArray]], optional
         If period is either 'validation' or 'test', this input is required. It contains the centering and scaling

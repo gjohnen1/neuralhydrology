@@ -286,7 +286,9 @@ class BaseTrainer(object):
                 break
 
             for key in data.keys():
-                if not key.startswith('date'):
+                if key.startswith('x_d'):
+                    data[key] = {k: v.to(self.device) for k, v in data[key].items()}
+                elif not key.startswith('date'):
                     data[key] = data[key].to(self.device)
 
             # apply possible pre-processing to the batch before the forward pass
