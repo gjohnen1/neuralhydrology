@@ -13,6 +13,7 @@ dependencies:
   - netcdf4
   - numba
   - pandas
+  - geopandas
   - pip
   - pytest
   - pytest-cov
