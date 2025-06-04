@@ -66,40 +66,28 @@ conda activate neuralhydrology
    python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
    ```
 
-## Installation Instructions
+## Troubleshooting
 
-### For RTX 4090 (Your Current Setup)
+### GPU Not Detected
+If `torch.cuda.is_available()` returns `False`:
+1. Verify NVIDIA drivers are installed: `nvidia-smi`
+2. Check CUDA version compatibility
+3. Recreate the environment with `environment_gpu.yml`
 
+### Performance Issues
+- GPU training is significantly faster than CPU
+- Ensure you're using `environment_gpu.yml` for NVIDIA GPUs
+- Monitor GPU usage with `nvidia-smi`
+
+### Environment Conflicts
+If you have installation issues:
 ```bash
-# Create the environment
-conda env create -f environments/environment_rtx40_series.yml
+# Remove existing environment
+conda remove -n neuralhydrology --all
 
-# Activate the environment
-conda activate neuralhydrology_rtx40
-
-# Install neuralhydrology in development mode
-pip install -e .
+# Recreate with appropriate environment file
+conda env create -f environments/environment_gpu.yml  # or environment_cpu.yml
 ```
-
-### For Other Systems
-
-1. **Check your NVIDIA driver version:**
-   ```bash
-   nvidia-smi
-   ```
-
-2. **Choose the appropriate environment:**
-   - Driver 535+ with RTX 40-series: `environment_rtx40_series.yml`
-   - Driver 535+ with other GPUs: `environment_cuda12.yml`
-   - Driver < 535: `environment_cuda11_8.yml`
-   - No GPU: `environment_cpu.yml`
-
-3. **Create and activate the environment:**
-   ```bash
-   conda env create -f environments/[chosen_environment].yml
-   conda activate neuralhydrology  # or neuralhydrology_rtx40 for RTX40 series
-   pip install -e .
-   ```
 
 ## Troubleshooting
 
