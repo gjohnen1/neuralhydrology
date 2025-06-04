@@ -1,34 +1,70 @@
 # Neuralhydrology Environment Setup Guide
 
-This directory contains conda environment files for different system configurations. Choose the appropriate environment based on your hardware and CUDA setup.
+This directory contains conda environment files for different system configurations. Choose the appropriate environment based on your hardware.
 
 ## Environment Files
 
-### For CUDA-enabled Systems (Recommended)
+### For GPU Systems (Recommended)
 
-**environment_rtx40_series.yml** - **BEST CHOICE for RTX 4090 and RTX 40-series GPUs**
-- Optimized for RTX 40-series GPUs (RTX 4090, 4080, 4070, etc.)
-- Uses PyTorch with CUDA 12.1 support via pip
-- Tested and working on RTX 4090 with NVIDIA driver 535+
-- Python 3.10
-
-**environment_cuda12.yml** - For general CUDA 12.x systems
-- Works with NVIDIA drivers 535+ and CUDA 12.x
-- Uses PyTorch with CUDA 12.1 support via pip
-- Python 3.10
-
-**environment_cuda11_8.yml** - For older CUDA 11.8 systems
-- For systems with NVIDIA drivers < 535
-- Works with RTX 30-series and older GPUs
-- Uses conda-installed PyTorch with CUDA 11.8
-- Python 3.10
+**environment_gpu.yml** - **GPU-accelerated training (RECOMMENDED)**
+- For NVIDIA GPUs with CUDA support
+- Compatible with modern GPUs (RTX 20/30/40 series, Tesla, etc.)
+- Requires NVIDIA drivers version 450+ and CUDA 11.8+
+- Uses PyTorch with CUDA 12.1 support
+- Python 3.12
 
 ### For CPU-only Systems
 
-**environment_cpu.yml** - CPU-only installation
-- No GPU acceleration
+**environment_cpu.yml** - **CPU-only training**
+- No GPU acceleration required
+- Works on any system (Windows, macOS, Linux)
 - Suitable for testing or systems without NVIDIA GPUs
-- Python 3.10
+- Python 3.12
+
+## Quick Start
+
+### For GPU systems:
+```bash
+conda env create -f environments/environment_gpu.yml
+conda activate neuralhydrology
+```
+
+### For CPU-only systems:
+```bash
+conda env create -f environments/environment_cpu.yml
+conda activate neuralhydrology
+```
+
+## Installation Instructions
+
+1. **Check your system:**
+   - Run `nvidia-smi` to check if you have an NVIDIA GPU
+   - If you see GPU information, use `environment_gpu.yml`
+   - If not, use `environment_cpu.yml`
+
+2. **Create the environment:**
+   ```bash
+   # For GPU systems
+   conda env create -f environments/environment_gpu.yml
+   
+   # For CPU systems  
+   conda env create -f environments/environment_cpu.yml
+   ```
+
+3. **Activate the environment:**
+   ```bash
+   conda activate neuralhydrology
+   ```
+
+4. **Install neuralhydrology package:**
+   ```bash
+   pip install -e .
+   ```
+
+5. **Verify installation:**
+   ```bash
+   python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+   ```
 
 ## Installation Instructions
 

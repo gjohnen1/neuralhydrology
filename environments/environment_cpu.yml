@@ -1,4 +1,5 @@
 # CPU-only environment for systems without NVIDIA GPUs or for testing
+# Works on any system (Windows, macOS, Linux) without GPU requirements
 name: neuralhydrology
 channels:
   - pytorch
@@ -16,7 +17,7 @@ dependencies:
   - pip
   - pytest
   - pytest-cov
-  - python=3.10
+  - python=3.12
   - ruamel.yaml
   - scipy
   - sphinx
@@ -25,6 +26,8 @@ dependencies:
   - yapf
   - pip:
     - torch
+    - torchvision
+    - torchaudio
     - tensorboard
     - sphinx-rtd-theme
     - nbsphinx
