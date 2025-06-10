@@ -37,7 +37,7 @@ from neuralhydrology.utils.errors import NoTrainDataError, NoEvaluationDataError
 LOGGER = logging.getLogger(__name__)
 
 
-class OnlineDataset(GenericDataset):
+class OnlineForecastDataset(GenericDataset):
     """Dataset that downloads meteorological data online and processes it for hydrological modeling.
     
     This dataset automatically downloads:
