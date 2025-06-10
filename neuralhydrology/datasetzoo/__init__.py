@@ -15,6 +15,7 @@ from neuralhydrology.datasetzoo.forecastdataset import ForecastDataset
 from neuralhydrology.datasetzoo.hourlycamelsus import HourlyCamelsUS
 from neuralhydrology.datasetzoo.lamah import LamaH
 from neuralhydrology.datasetzoo.dietersheim import Dietersheim
+from neuralhydrology.datasetzoo.onlinedataset import OnlineDataset
 from neuralhydrology.utils.config import Config
 from neuralhydrology.datasetzoo.datasetregistry import DatasetRegistry
 
@@ -28,9 +29,9 @@ def get_dataset(cfg: Config,
                 scaler: dict = {}) -> BaseDataset:
     """Get data set instance, depending on the run configuration.
 
-    Currently implemented datasets are 'caravan', 'camels_aus', 'camels_br', 'camels_cl', 'camels_gb', 'camels_us', and
-    'hourly_camels_us', as well as the 'generic' dataset class that can be used for any kind of dataset as long as it is
-    in the correct format.
+    Currently implemented datasets are 'caravan', 'camels_aus', 'camels_br', 'camels_cl', 'camels_gb', 'camels_us', 
+    'hourly_camels_us', 'forecast', and 'online', as well as the 'generic' dataset class that can be used for any kind 
+    of dataset as long as it is in the correct format.
 
     New dataset classes can be added at the beginning of runtime using the function register_dataset().
 
@@ -87,14 +88,14 @@ def get_dataset(cfg: Config,
         Dataset = HourlyHarz
     elif cfg.dataset.lower() == "generic":
         Dataset = GenericDataset
-    elif cfg.dataset.lower() == "dietersheim":
-        Dataset = Dietersheim
     elif cfg.dataset.lower() in ["lamah_a", "lamah_b", "lamah_c"]:
         Dataset = LamaH
     elif cfg.dataset.lower() == "caravan":
         Dataset = Caravan
     elif cfg.dataset.lower() == "forecast":
         Dataset = ForecastDataset
+    elif cfg.dataset.lower() == "online":
+        Dataset = OnlineDataset
     else:
         raise NotImplementedError(f"No dataset class implemented for dataset {cfg.dataset}")
 
