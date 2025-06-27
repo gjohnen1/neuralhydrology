@@ -1,4 +1,4 @@
-"""Dataset class for loading basin forecast and historical data from NetCDF files."""
+"""Dataset class for loading basin forecast and historical data from online sources."""
 
 import logging
 import pickle
@@ -25,16 +25,19 @@ LOGGER = logging.getLogger(__name__)
 
 
 class OnlineForecastDataset(GenericDataset):
-    """Dataset for loading basin forecast and historical data from NetCDF files.
+    """Dataset for loading basin forecast and historical data from online sources or NetCDF files.
     
-    This dataset expects data to be structured like the basin_forecasts_historical dataset:
+    This dataset is designed to work with combined forecast-historical datasets like those
+    created by the operational_harz pipeline. It expects data structured as:
     - Hindcast features: indexed by (basin, time) - historical/observational data
     - Forecast features: indexed by (basin, time, lead_time) - forecast data with lead times
     
-    The dataset will automatically load data from NetCDF files and handle the 
-    separation of hindcast vs forecast variables according to the configuration.
-    It provides the same I/O interface as ForecastDataset but is optimized for 
-    multi-basin forecast datasets with lead_time dimensions.
+    The dataset can either:
+    1. Load pre-processed NetCDF files containing this combined structure
+    2. Work with xarray datasets passed directly (for online workflows)
+    
+    It provides the same interface as ForecastDataset but handles the multi-dimensional
+    forecast structure with lead_time dimensions.
     
     Parameters
     ----------
@@ -52,6 +55,8 @@ class OnlineForecastDataset(GenericDataset):
         Basin ID to integer mapping for one-hot encoding.
     scaler : Dict[str, Union[pd.Series, xarray.DataArray]], optional
         Scaling parameters for features.
+    online_dataset : xr.Dataset, optional
+        Pre-loaded xarray dataset (for online workflows that bypass file loading).
     """
 
     def __init__(self,
@@ -61,7 +66,11 @@ class OnlineForecastDataset(GenericDataset):
                  basin: str = None,
                  additional_features: List[Dict[str, pd.DataFrame]] = [],
                  id_to_int: Dict[str, int] = {},
-                 scaler: Dict[str, Union[pd.Series, xr.DataArray]] = {}):
+                 scaler: Dict[str, Union[pd.Series, xr.DataArray]] = {},
+                 online_dataset: Optional[xr.Dataset] = None):
+        
+        # Store the online dataset if provided
+        self.online_dataset = online_dataset
         
         # Initialize the parent class with BaseDataset constructor to get the same structure as ForecastDataset
         super(GenericDataset, self).__init__(cfg=cfg,
@@ -75,7 +84,7 @@ class OnlineForecastDataset(GenericDataset):
         # Initialize forecast-specific configuration
         self._initialize_frequency_configuration()
         
-        # Load xarray dataset
+        # Load xarray dataset (either from files or use provided online dataset)
         self.xr = self._load_or_create_xarray_dataset()
         
         # Create lookup table and pytorch tensors
@@ -112,6 +121,12 @@ class OnlineForecastDataset(GenericDataset):
 
     def _load_or_create_xarray_dataset(self) -> xr.Dataset:
         """Load or create xarray dataset with same structure as ForecastDataset."""
+        
+        # If an online dataset was provided, use it directly
+        if self.online_dataset is not None:
+            LOGGER.info("Using provided online dataset")
+            return self._process_online_dataset(self.online_dataset)
+            
         # if no netCDF file is passed, data set is created from raw basin files
         if (self.cfg.train_data_file is None) or (not self.is_train):
             data_list = []
@@ -293,6 +308,39 @@ class OnlineForecastDataset(GenericDataset):
                 self.frequencies = [native_frequency]
 
         return xr_final
+
+    def _process_online_dataset(self, online_ds: xr.Dataset) -> xr.Dataset:
+        """Process an online dataset to match expected structure."""
+        
+        # Validate that the dataset has the expected structure
+        if 'basin' not in online_ds.dims:
+            raise ValueError("Online dataset must have 'basin' dimension")
+        if 'time' not in online_ds.dims:
+            raise ValueError("Online dataset must have 'time' dimension") 
+            
+        # Check if we have forecast variables (should have lead_time dimension)
+        forecast_vars = [var for var in online_ds.data_vars if 'lead_time' in online_ds[var].dims]
+        hindcast_vars = [var for var in online_ds.data_vars if 'lead_time' not in online_ds[var].dims and var != 'basin']
+        
+        LOGGER.info(f"Found {len(forecast_vars)} forecast variables and {len(hindcast_vars)} hindcast variables")
+        
+        # Infer frequency from time coordinate
+        if not self.frequencies:
+            native_frequency = utils.infer_frequency(online_ds["time"].values)
+            self.frequencies = [native_frequency]
+            LOGGER.info(f"Inferred frequency: {native_frequency}")
+        
+        # Filter basins if needed
+        if self.basins:
+            # Only keep basins that are in both the dataset and our basin list
+            available_basins = [b for b in self.basins if b in online_ds.basin.values]
+            if available_basins:
+                online_ds = online_ds.sel(basin=available_basins)
+                LOGGER.info(f"Filtered to {len(available_basins)} basins: {available_basins}")
+            else:
+                raise ValueError(f"None of the requested basins {self.basins} found in online dataset")
+        
+        return online_ds
 
     def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
         basin, indices = self.lookup_table[item]
@@ -564,6 +612,9 @@ def validate_samples(x_h: List[np.ndarray],
 
             # add forecast_offset here, because it determines how many timesteps ahead we're going to be predicting (remember forecast_offset is the number of timesteps between initialization and the first forecast)
             if x_h is not None and (last_sample_of_freq + forecast_offset + forecast_seq_length[i]) > len(x_h[i]):
+                flag[j] = 0
+                continue 
+            if x_f is not None and (last_sample_of_freq + forecast_offset) >= len(x_f[i]):
                 flag[j] = 0
                 continue 
 
