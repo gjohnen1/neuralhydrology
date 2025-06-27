@@ -554,6 +554,99 @@ class OnlineForecastDataset(GenericDataset):
             else:
                 raise NoEvaluationDataError
 
+    def load_local_historical_data(timeseries_dir: Path, centroids: pd.DataFrame, start_date: str, end_date: str) -> xr.Dataset:
+        """Load local historical data from CSV files for multiple basins.
+    
+        This function loads historical timeseries data from local CSV files stored in the timeseries directory.
+        It's designed to work with the Harz dataset structure where each basin has its own CSV file.
+    
+        Parameters
+        ----------
+        timeseries_dir : Path
+            Path to the directory containing the timeseries CSV files (e.g., data/harz/timeseries)
+        centroids : pd.DataFrame
+            DataFrame containing basin information with 'basin_name' column
+        start_date : str
+            Start date for the historical data in format 'YYYY-MM-DD'
+        end_date : str 
+            End date for the historical data in format 'YYYY-MM-DD'
+        
+        Returns
+        -------
+        xr.Dataset
+            xarray Dataset containing historical data indexed by 'basin' and 'time'
+        
+        Raises
+        ------
+        FileNotFoundError
+            If the timeseries directory doesn't exist or basin files are missing
+        """
+        if not timeseries_dir.exists():
+            raise FileNotFoundError(f"Timeseries directory not found: {timeseries_dir}")
+    
+        basin_data_list = []
+    
+        for _, row in centroids.iterrows():
+            basin_name = row['basin_name']
+        
+            # Look for the basin's CSV file
+            basin_file = timeseries_dir / f"hydromet_timeseries_{basin_name}.csv"
+        
+            if not basin_file.exists():
+                LOGGER.warning(f"No timeseries file found for basin {basin_name} at {basin_file}")
+                continue
+            
+            try:
+                # Load the CSV file
+                df = pd.read_csv(basin_file, index_col='date', parse_dates=['date'])
+            
+                # Filter by date range
+                start_dt = pd.to_datetime(start_date)
+                end_dt = pd.to_datetime(end_date)
+                df = df.loc[start_dt:end_dt]
+            
+                if df.empty:
+                    LOGGER.warning(f"No data in date range {start_date} to {end_date} for basin {basin_name}")
+                    continue
+            
+                # Convert to xarray Dataset
+                data_vars = {}
+                for col in df.columns:
+                    # Add '_hist' suffix to distinguish from forecast variables
+                    var_name = f"{col}_hist" if not col.endswith('_hist') else col
+                    data_vars[var_name] = (('time',), df[col].astype(np.float32).values)
+            
+                basin_ds = xr.Dataset(
+                    data_vars,
+                    coords={
+                        'time': df.index.values,
+                        'basin': basin_name
+                    }
+                )
+                basin_ds = basin_ds.expand_dims('basin')
+            
+                # Add metadata
+                basin_ds.attrs['source'] = 'local_csv_files'
+                basin_ds.attrs['basin_file'] = str(basin_file)
+                basin_ds.attrs['date_range'] = f"{start_date} to {end_date}"
+            
+                basin_data_list.append(basin_ds)
+            
+            except Exception as e:
+                LOGGER.error(f"Error loading data for basin {basin_name}: {e}")
+                continue
+    
+        if not basin_data_list:
+            raise RuntimeError("No historical data could be loaded for any basin")
+    
+        # Combine all basin datasets
+        try:
+            combined_ds = xr.concat(basin_data_list, dim="basin")
+            LOGGER.info(f"Successfully loaded historical data for {len(basin_data_list)} basins")
+            return combined_ds
+        except Exception as e:
+            raise RuntimeError(f"Error combining historical datasets: {e}")
+
 
 @njit()
 def validate_samples(x_h: List[np.ndarray], 
@@ -644,45 +737,56 @@ def validate_samples(x_h: List[np.ndarray],
     return flag
 
 def load_timeseries(data_dir: Path, time_series_data_sub_dir: str, basin: str, columns: list) -> pd.DataFrame:
-    """Load time series data from netCDF files into pandas DataFrame.
+    """Load time series data from CSV files into pandas DataFrame.
+    
+    This function is adapted for the OnlineForecastDataset to load historical data from CSV files
+    rather than NetCDF files, following the Harz dataset structure.
 
     Parameters
     ----------
     data_dir : Path
-        Path to the data directory. This folder must contain a folder called 'time_series' containing the time series
-        data for each basin as a single time-indexed netCDF file called '<basin_id>.nc/nc4'.
+        Path to the data directory. This folder must contain a folder called 'timeseries' containing the time series
+        data for each basin as CSV files named 'hydromet_timeseries_{basin}.csv'.
     time_series_data_sub_dir : str
-        Subdirectory within time_series containing the data files.
+        Subdirectory within timeseries containing the data files (can be None for direct access).
     basin : str
         The basin identifier.
     columns : list
-        List of column names to load from the netCDF file.
+        List of column names to load from the CSV file.
 
     Returns
     -------
     pd.DataFrame
-        Time-indexed DataFrame containing the time series data as stored in the netCDF file.
+        Time-indexed DataFrame containing the time series data as stored in the CSV file.
 
     Raises
     ------
     FileNotFoundError
-        If no netCDF file exists for the specified basin.
-    ValueError
-        If more than one netCDF file is found for the specified basin.
+        If no CSV file exists for the specified basin.
     """
-    files_dir = data_dir / "time_series"
+    timeseries_dir = data_dir / "timeseries"
+    
     # Allow time series data from different members
     if time_series_data_sub_dir is not None:
-        files_dir = files_dir / time_series_data_sub_dir
+        timeseries_dir = timeseries_dir / time_series_data_sub_dir
 
-    netcdf_files = list(files_dir.glob("*.nc4"))
-    netcdf_files.extend(files_dir.glob("*.nc"))
-    netcdf_file = [f for f in netcdf_files if f.stem == basin]
-    if len(netcdf_file) == 0:
-        raise FileNotFoundError(f"No netCDF file found for basin {basin} in {files_dir}")
-    if len(netcdf_file) > 1:
-        raise ValueError(f"Multiple netCDF files found for basin {basin} in {files_dir}")
+    # Look for CSV file following Harz naming convention
+    csv_file = timeseries_dir / f"hydromet_timeseries_{basin}.csv"
+    
+    if not csv_file.exists():
+        raise FileNotFoundError(f"No CSV file found for basin {basin} at {csv_file}")
 
-    xr_data = xr.open_dataset(netcdf_file[0])
-    xr_data = xr_data[columns]
-    return xr_data.to_dataframe()
+    # Load CSV file
+    df = pd.read_csv(csv_file, index_col='date', parse_dates=['date'])
+    
+    # Filter columns if specified
+    if columns:
+        available_columns = [col for col in columns if col in df.columns]
+        if available_columns:
+            df = df[available_columns]
+        else:
+            LOGGER.warning(f"None of the requested columns {columns} found in {csv_file}")
+            # Return empty DataFrame with correct index
+            df = pd.DataFrame(index=df.index)
+    
+    return df
