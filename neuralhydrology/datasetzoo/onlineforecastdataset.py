@@ -129,174 +129,10 @@ class OnlineForecastDataset(GenericDataset):
             
         # if no netCDF file is passed, data set is created from raw basin files
         if (self.cfg.train_data_file is None) or (not self.is_train):
-            data_list = []
-            
-            # Ensure we have required config variables for forecast mode
-            if not hasattr(self.cfg, 'hindcast_inputs') or not hasattr(self.cfg, 'forecast_inputs'):
-                raise ValueError("Both 'hindcast_inputs' and 'forecast_inputs' must be specified in config for OnlineForecastDataset")
-            
-            # Define columns to keep for hindcast and forecast data
-            hcst_keep_cols = self.cfg.target_variables + self.cfg.hindcast_inputs
-            fcst_keep_cols = self.cfg.forecast_inputs 
-
-            if not self._disable_pbar:
-                LOGGER.info("Loading basin data into xarray data set.")
-            for basin in tqdm(self.basins, disable=self._disable_pbar, file=sys.stdout):
-
-                df_hcst = self._load_basin_data(basin, hcst_keep_cols)
-                df_fcst = self._load_basin_data(basin, fcst_keep_cols) 
-
-                # Handle different index structures
-                if isinstance(df_fcst.index, pd.MultiIndex):
-                    # Already has the correct MultiIndex structure (date, lead_time)
-                    if df_fcst.index.names != ['date', 'lead_time']:
-                        # Rename indices if needed
-                        df_fcst.index.names = ['date', 'lead_time']
-                    lead_times = df_fcst.index.unique(level='lead_time')
-                else:
-                    # Need to handle case where forecast data doesn't have MultiIndex
-                    # This might happen if the data was flattened or has different structure
-                    raise ValueError(f"Forecast data for basin {basin} should have MultiIndex (date, lead_time)")
-
-                # add columns from dataframes passed as additional data files
-                if self.additional_features:
-                    df_hcst = pd.concat([df_hcst, *[d[basin] for d in self.additional_features if basin in d]], axis=1)
-                    df_fcst = pd.concat([df_fcst, *[d[basin] for d in self.additional_features if basin in d]], axis=1)
-                    
-                # if target variables are missing for basin, add empty column to still allow predictions to be made
-                if not self.is_train:
-                    # target variables held in hcst dataset
-                    df_hcst = self._add_missing_targets(df_hcst)
-
-                # check if any feature should be duplicated
-                df_hcst = self._duplicate_features(df_hcst)
-                df_fcst = self._duplicate_features(df_fcst)
-
-                # check if a shifted copy of a feature should be added
-                df_fcst = self._add_lagged_features(df_fcst)
-                df_hcst = self._add_lagged_features(df_hcst)
-
-                # Make end_date the last second of the specified day, such that the
-                # dataset will include all hours of the last day, not just 00:00.
-                start_dates = self.start_and_end_dates[basin]["start_dates"]
-                end_dates = [
-                    date + pd.Timedelta(days=1, seconds=-1) for date in self.start_and_end_dates[basin]["end_dates"]
-                ]
-
-                # infer native frequency from hindcast data 
-                native_frequency = utils.infer_frequency(df_hcst.index)
-                if not self.frequencies:
-                    self.frequencies = [native_frequency]  # use df's native resolution by default
-
-                # Assert that the used frequencies are lower or equal than the native frequency
-                try:
-                    freq_vs_native = [utils.compare_frequencies(freq, native_frequency) for freq in self.frequencies]
-                except ValueError:
-                    LOGGER.warning('Cannot compare provided frequencies with native frequency. '
-                                   'Make sure the frequencies are not higher than the native frequency.')
-                    freq_vs_native = []
-                if any(comparison > 1 for comparison in freq_vs_native):
-                    raise ValueError(f'Frequency is higher than native data frequency {native_frequency}.')
-
-                # used to get the maximum warmup-offset across all frequencies
-                offsets = [(self.seq_len[i] - max(self._predict_last_n[i], self._forecast_seq_len[i])) * to_offset(freq)
-                           for i, freq in enumerate(self.frequencies)]
-                
-                hcst_basin_data_list = []
-                fcst_basin_data_list = []
-                
-                # create xarray data set for each period slice of the specific basin
-                for i, (start_date, end_date) in enumerate(zip(start_dates, end_dates)):
-                    # if the start date is not aligned with the frequency, the resulting datetime indices will be off
-                    if not all(to_offset(freq).is_on_offset(start_date) for freq in self.frequencies):
-                        misaligned = [freq for freq in self.frequencies if not to_offset(freq).is_on_offset(start_date)]
-                        raise ValueError(f'start date {start_date} is not aligned with frequencies {misaligned}.')
-
-                    # add warmup period
-                    warmup_start_date = min(start_date - offset for offset in offsets)
-                    df_hcst_sub = df_hcst[warmup_start_date:end_date]
-
-                    # `df_fcst_sub` has a multiindex
-                    idx = pd.IndexSlice
-                    df_fcst_sub = df_fcst.loc[idx[start_date:end_date, :], :]
-
-                    # make sure the df covers the full date range, filling gaps with NaNs
-                    full_range = pd.date_range(start=warmup_start_date, end=end_date, freq=native_frequency)
-                    df_hcst_sub = df_hcst_sub.reindex(pd.DatetimeIndex(full_range, name=df_hcst_sub.index.name))
-                    
-                    # Select the rows between the start_date and end_date
-                    full_range = pd.date_range(start=start_date, end=end_date, freq=native_frequency)
-                    df_fcst_sub = df_fcst_sub.reindex(pd.MultiIndex.from_product([full_range, lead_times], names=['date', 'lead_time']))
-
-                    # Set all targets before period start to NaN
-                    if self.cfg.target_variables:
-                        target_cols = [col for col in self.cfg.target_variables if col in df_hcst_sub.columns]
-                        if target_cols:
-                            df_hcst_sub.loc[df_hcst_sub.index < start_date, target_cols] = np.nan
-
-                    hcst_basin_data_list.append(df_hcst_sub)
-                    fcst_basin_data_list.append(df_fcst_sub)
-
-                if not hcst_basin_data_list:
-                    # Skip basin in case no start and end dates where defined.
-                    continue
-
-                # In case of multiple time slices per basin, stack the time slices in the time dimension.
-                df_hcst = pd.concat(hcst_basin_data_list, axis=0)
-                df_fcst = pd.concat(fcst_basin_data_list, axis=0)
-
-                # Handle duplicated indices due to overlaps between warmup and training periods
-                df_non_duplicated = df_hcst[~df_hcst.index.duplicated(keep=False)]
-                df_duplicated = df_hcst[df_hcst.index.duplicated(keep=False)]
-                filtered_duplicates = []
-                
-                if not df_duplicated.empty:
-                    for _, grp in df_duplicated.groupby(level=0):  # Group by date level
-                        if self.cfg.target_variables:
-                            target_cols = [col for col in self.cfg.target_variables if col in grp.columns]
-                            if target_cols:
-                                mask = ~grp[target_cols].isna().any(axis=1)
-                                if not mask.any():
-                                    filtered_duplicates.append(grp.head(1))
-                                else:
-                                    filtered_duplicates.append(grp[mask].head(1))
-                            else:
-                                filtered_duplicates.append(grp.head(1))
-                        else:
-                            filtered_duplicates.append(grp.head(1))
-
-                if filtered_duplicates:
-                    df_filtered_duplicates = pd.concat(filtered_duplicates, axis=0)
-                    df_hcst = pd.concat([df_non_duplicated, df_filtered_duplicates], axis=0)
-                else:
-                    df_hcst = df_non_duplicated
-
-                # Sort by DatetimeIndex and reindex to fill gaps with NaNs.
-                df_hcst = df_hcst.sort_index(axis=0, ascending=True)
-                df_hcst = df_hcst.reindex(
-                    pd.DatetimeIndex(data=pd.date_range(df_hcst.index[0], df_hcst.index[-1], freq=native_frequency),
-                                     name=df_hcst.index.name))
-                
-                # Convert to xarray Dataset and add basin string as additional coordinate
-                xr_fcst = xr.Dataset.from_dataframe(df_fcst.astype(np.float32))
-                xr_hcst = xr.Dataset.from_dataframe(df_hcst.astype(np.float32))
-
-                # merging xarray datasets has the convenient side-effect that both forecast and hindcast data will have the same temporal extent
-                xr_merged = xr_fcst.merge(xr_hcst) 
-                xr_merged = xr_merged.assign_coords({'basin': basin})
-                data_list.append(xr_merged)
-
-            if not data_list:
-                # If no period for no basin has defined timeslices, raise error.
-                if self.is_train:
-                    raise NoTrainDataError
-                else:
-                    raise NoEvaluationDataError
-
-            # create one large dataset that has two coordinates: datetime and basin
-            xr_final = xr.concat(data_list, dim="basin")
-            if self.is_train and self.cfg.save_train_data:
-                self._save_xarray_dataset(xr_final)
+            # For OnlineForecastDataset, we should only reach here if no online dataset was provided
+            # In this case, we expect pre-processed NetCDF files that contain both hindcast and forecast data
+            raise ValueError("OnlineForecastDataset requires either an online_dataset parameter or pre-saved NetCDF files. "
+                           "Use the basin_forecasts_historical.ipynb workflow to create the online dataset first.") 
 
         else:
             # Otherwise we can reload previously-saved training data
@@ -310,7 +146,7 @@ class OnlineForecastDataset(GenericDataset):
         return xr_final
 
     def _process_online_dataset(self, online_ds: xr.Dataset) -> xr.Dataset:
-        """Process an online dataset to match expected structure."""
+        """Process an online dataset to match expected structure and assign features correctly."""
         
         # Validate that the dataset has the expected structure
         if 'basin' not in online_ds.dims:
@@ -318,29 +154,97 @@ class OnlineForecastDataset(GenericDataset):
         if 'time' not in online_ds.dims:
             raise ValueError("Online dataset must have 'time' dimension") 
             
-        # Check if we have forecast variables (should have lead_time dimension)
-        forecast_vars = [var for var in online_ds.data_vars if 'lead_time' in online_ds[var].dims]
-        hindcast_vars = [var for var in online_ds.data_vars if 'lead_time' not in online_ds[var].dims and var != 'basin']
+        # Validate that we have the required config for feature assignment
+        if not hasattr(self.cfg, 'hindcast_inputs'):
+            raise ValueError("Config must specify 'hindcast_inputs' for OnlineForecastDataset")
+        if not hasattr(self.cfg, 'forecast_inputs'):
+            raise ValueError("Config must specify 'forecast_inputs' for OnlineForecastDataset")
+            
+        # Separate forecast and hindcast variables based on lead_time dimension
+        all_forecast_vars = [var for var in online_ds.data_vars if 'lead_time' in online_ds[var].dims]
+        all_hindcast_vars = [var for var in online_ds.data_vars if 'lead_time' not in online_ds[var].dims and var != 'basin']
         
-        LOGGER.info(f"Found {len(forecast_vars)} forecast variables and {len(hindcast_vars)} hindcast variables")
+        # Map config-specified variables to actual dataset variables
+        # For forecast inputs, check if they exist in the forecast variables
+        forecast_vars_to_use = []
+        for var in self.cfg.forecast_inputs:
+            if var in all_forecast_vars:
+                forecast_vars_to_use.append(var)
+            else:
+                # Check if there are quartile versions of this variable
+                quartile_vars = [v for v in all_forecast_vars if v.startswith(f"{var}_q")]
+                if quartile_vars:
+                    forecast_vars_to_use.extend(quartile_vars)
+                    LOGGER.info(f"Using quartile variables {quartile_vars} for forecast input '{var}'")
+                else:
+                    LOGGER.warning(f"Forecast input '{var}' not found in dataset. Available forecast vars: {all_forecast_vars[:5]}...")
+        
+        # For hindcast inputs, check if they exist in the hindcast variables
+        hindcast_vars_to_use = []
+        for var in self.cfg.hindcast_inputs:
+            if var in all_hindcast_vars:
+                hindcast_vars_to_use.append(var)
+            else:
+                # Check for renamed versions (e.g., with '_hist' suffix)
+                hist_var = f"{var}_hist"
+                if hist_var in all_hindcast_vars:
+                    hindcast_vars_to_use.append(hist_var)
+                    LOGGER.info(f"Using historical variable '{hist_var}' for hindcast input '{var}'")
+                else:
+                    LOGGER.warning(f"Hindcast input '{var}' not found in dataset. Available hindcast vars: {all_hindcast_vars[:5]}...")
+        
+        # Add target variables to hindcast variables
+        target_vars_to_use = []
+        for var in self.cfg.target_variables:
+            if var in all_hindcast_vars:
+                target_vars_to_use.append(var)
+            else:
+                LOGGER.warning(f"Target variable '{var}' not found in hindcast variables.")
+        
+        # Create final variable lists
+        final_forecast_vars = forecast_vars_to_use
+        final_hindcast_vars = list(set(hindcast_vars_to_use + target_vars_to_use))
+        
+        LOGGER.info(f"Selected {len(final_forecast_vars)} forecast variables: {final_forecast_vars[:5]}...")
+        LOGGER.info(f"Selected {len(final_hindcast_vars)} hindcast variables: {final_hindcast_vars[:5]}...")
+        
+        # Filter the dataset to only include selected variables
+        selected_vars = final_forecast_vars + final_hindcast_vars
+        if selected_vars:
+            # Keep coordinates and selected data variables
+            coords_to_keep = {k: v for k, v in online_ds.coords.items()}
+            data_vars_to_keep = {k: v for k, v in online_ds.data_vars.items() if k in selected_vars}
+            
+            filtered_ds = xr.Dataset(
+                data_vars=data_vars_to_keep,
+                coords=coords_to_keep,
+                attrs=online_ds.attrs.copy()
+            )
+        else:
+            raise ValueError("No valid variables found in online dataset matching config specifications")
         
         # Infer frequency from time coordinate
         if not self.frequencies:
-            native_frequency = utils.infer_frequency(online_ds["time"].values)
+            native_frequency = utils.infer_frequency(filtered_ds["time"].values)
             self.frequencies = [native_frequency]
             LOGGER.info(f"Inferred frequency: {native_frequency}")
         
         # Filter basins if needed
         if self.basins:
             # Only keep basins that are in both the dataset and our basin list
-            available_basins = [b for b in self.basins if b in online_ds.basin.values]
+            available_basins = [b for b in self.basins if b in filtered_ds.basin.values]
             if available_basins:
-                online_ds = online_ds.sel(basin=available_basins)
+                filtered_ds = filtered_ds.sel(basin=available_basins)
                 LOGGER.info(f"Filtered to {len(available_basins)} basins: {available_basins}")
             else:
                 raise ValueError(f"None of the requested basins {self.basins} found in online dataset")
         
-        return online_ds
+        # Update config to reflect the actual variables being used
+        # This ensures that the _create_lookup_table method works correctly
+        self.cfg.forecast_inputs = final_forecast_vars
+        self.cfg.hindcast_inputs = [var for var in final_hindcast_vars if var not in self.cfg.target_variables]
+        
+        return filtered_ds
 
     def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
         basin, indices = self.lookup_table[item]
@@ -535,9 +439,9 @@ class OnlineForecastDataset(GenericDataset):
             if valid_samples.size > 0:
                 if not self.cfg.hindcast_inputs:
                     raise ValueError('Hindcast inputs must be provided if forecast inputs are provided.')
-                self._x_h[basin] = {freq: torch.from_numpy(_x_h.astype(np.float32)) for freq, _x_h in x_h.items()}
-                self._x_f[basin] = {freq: torch.from_numpy(_x_f.astype(np.float32)) for freq, _x_f in x_f.items()}
-                self._y[basin] = {freq: torch.from_numpy(_y.astype(np.float32)) for freq, _y in y.items()}
+                self._x_h[basin] = {freq: torch.from_numpy(x_h[freq].astype(np.float32)) for freq in self.frequencies}
+                self._x_f[basin] = {freq: torch.from_numpy(x_f[freq].astype(np.float32)) for freq in self.frequencies}
+                self._y[basin] = {freq: torch.from_numpy(y[freq].astype(np.float32)) for freq in self.frequencies}
                 self._dates[basin] = dates
             else:
                 basins_without_samples.append(basin)
@@ -763,6 +667,11 @@ def load_timeseries(data_dir: Path, time_series_data_sub_dir: str, basin: str, c
     ------
     FileNotFoundError
         If no CSV file exists for the specified basin.
+    
+    Note
+    ----
+    This function is only intended for loading historical (hindcast) data from CSV files.
+    Forecast data should be provided through the online_dataset parameter in the dataset constructor.
     """
     timeseries_dir = data_dir / "timeseries"
     
@@ -774,10 +683,21 @@ def load_timeseries(data_dir: Path, time_series_data_sub_dir: str, basin: str, c
     csv_file = timeseries_dir / f"hydromet_timeseries_{basin}.csv"
     
     if not csv_file.exists():
-        raise FileNotFoundError(f"No CSV file found for basin {basin} at {csv_file}")
+        # If asking for forecast inputs from CSV, this is likely an error in usage
+        if columns and any('q25' in col or 'q50' in col or 'q75' in col for col in columns):
+            raise FileNotFoundError(
+                f"No CSV file found for basin {basin} at {csv_file}. "
+                f"Note: Forecast variables (with quartiles) should be provided via the online_dataset parameter, "
+                f"not loaded from CSV files."
+            )
+        else:
+            raise FileNotFoundError(f"No CSV file found for basin {basin} at {csv_file}")
 
     # Load CSV file
-    df = pd.read_csv(csv_file, index_col='date', parse_dates=['date'])
+    try:
+        df = pd.read_csv(csv_file, index_col='date', parse_dates=['date'])
+    except Exception as e:
+        raise ValueError(f"Error reading CSV file {csv_file}: {e}")
     
     # Filter columns if specified
     if columns:
@@ -785,8 +705,8 @@ def load_timeseries(data_dir: Path, time_series_data_sub_dir: str, basin: str, c
         if available_columns:
             df = df[available_columns]
         else:
-            LOGGER.warning(f"None of the requested columns {columns} found in {csv_file}")
-            # Return empty DataFrame with correct index
+            LOGGER.warning(f"None of the requested columns {columns} found in {csv_file}. Available columns: {list(df.columns)}")
+            # Return empty DataFrame with correct index but no columns
             df = pd.DataFrame(index=df.index)
     
     return df
