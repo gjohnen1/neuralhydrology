@@ -1,4 +1,13 @@
-"""Dataset class for loading basin forecast and historical data from online sources."""
+"""Dataset class for loading basin forecast and historical data from online sources and local CSV files.
+
+This module provides the OnlineForecastDataset class, which is designed to work with the 
+operational_harz pipeline that combines:
+- Historical data from local CSV files (per-basin format: 'hydromet_timeseries_{basin}.csv')
+- Forecast data from online sources (NOAA GEFS via the basin_forecasts_historical.ipynb workflow)
+
+The primary workflow expects an online_dataset parameter containing both data types,
+with CSV loading as a fallback for historical data only.
+"""
 
 import logging
 import pickle
@@ -25,16 +34,19 @@ LOGGER = logging.getLogger(__name__)
 
 
 class OnlineForecastDataset(GenericDataset):
-    """Dataset for loading basin forecast and historical data from online sources or NetCDF files.
+    """Dataset for loading basin forecast and historical data from online sources and local CSV files.
     
     This dataset is designed to work with combined forecast-historical datasets like those
     created by the operational_harz pipeline. It expects data structured as:
-    - Hindcast features: indexed by (basin, time) - historical/observational data
-    - Forecast features: indexed by (basin, time, lead_time) - forecast data with lead times
+    - Hindcast features: indexed by (basin, time) - historical/observational data from CSV files
+    - Forecast features: indexed by (basin, time, lead_time) - forecast data from online sources
     
     The dataset can either:
-    1. Load pre-processed NetCDF files containing this combined structure
-    2. Work with xarray datasets passed directly (for online workflows)
+    1. Work with xarray datasets passed directly (for online workflows) - RECOMMENDED
+    2. Load pre-processed NetCDF files containing the combined structure (fallback)
+    
+    Historical data is loaded from per-basin CSV files (e.g., 'hydromet_timeseries_{basin}.csv')
+    while forecast data comes from online sources and is passed via the online_dataset parameter.
     
     It provides the same interface as ForecastDataset but handles the multi-dimensional
     forecast structure with lead_time dimensions.
@@ -43,6 +55,7 @@ class OnlineForecastDataset(GenericDataset):
     ----------
     cfg : Config
         The run configuration containing paths and variable specifications.
+        Must include 'data_dir' pointing to directory containing 'timeseries/' subfolder with CSV files.
     is_train : bool
         Defines if the dataset is used for training or evaluating.
     period : {'train', 'validation', 'test'}
@@ -56,7 +69,9 @@ class OnlineForecastDataset(GenericDataset):
     scaler : Dict[str, Union[pd.Series, xarray.DataArray]], optional
         Scaling parameters for features.
     online_dataset : xr.Dataset, optional
-        Pre-loaded xarray dataset (for online workflows that bypass file loading).
+        Pre-loaded xarray dataset containing both historical and forecast data
+        (created from basin_forecasts_historical.ipynb workflow). This is the primary
+        data source and bypasses CSV file loading when provided.
     """
 
     def __init__(self,
@@ -81,6 +96,28 @@ class OnlineForecastDataset(GenericDataset):
                                              id_to_int=id_to_int,
                                              scaler=scaler)
         
+        """
+        Data Loading Strategy:
+        
+        PRIMARY WORKFLOW (Recommended):
+        ===============================
+        1. online_dataset parameter contains combined historical+forecast data
+        2. Created via basin_forecasts_historical.ipynb workflow
+        3. Historical variables: (basin, time) - from local CSV + online sources  
+        4. Forecast variables: (basin, time, lead_time) - from online GEFS data
+        
+        FALLBACK WORKFLOW:
+        ==================
+        1. Load from pre-saved NetCDF files (cfg.train_data_file)
+        2. CSV loading alone is NOT supported for forecast data
+        
+        Variable Assignment:
+        ===================
+        - cfg.hindcast_inputs: Variables without lead_time dimension
+        - cfg.forecast_inputs: Variables with lead_time dimension  
+        - cfg.target_variables: Prediction targets (typically in hindcast data)
+        """
+        
         # Initialize forecast-specific configuration
         self._initialize_frequency_configuration()
         
@@ -91,8 +128,13 @@ class OnlineForecastDataset(GenericDataset):
         self._create_lookup_table(self.xr)
 
     def _load_basin_data(self, basin: str, columns: list) -> pd.DataFrame:
-        """Load input and output data from NetCDF files, similar to ForecastDataset."""
-        # Load timeseries data using the same pattern as ForecastDataset
+        """Load input and output data from CSV files for historical data.
+        
+        Note: This method is only used as a fallback when no online_dataset is provided.
+        The primary workflow should use the online_dataset parameter which contains
+        both historical and forecast data from the basin_forecasts_historical.ipynb workflow.
+        """
+        # Load timeseries data from CSV files using Harz dataset structure
         df = load_timeseries(data_dir=self.cfg.data_dir, 
                            time_series_data_sub_dir=self.cfg.time_series_data_sub_dir, 
                            basin=basin, 
@@ -127,23 +169,27 @@ class OnlineForecastDataset(GenericDataset):
             LOGGER.info("Using provided online dataset")
             return self._process_online_dataset(self.online_dataset)
             
-        # if no netCDF file is passed, data set is created from raw basin files
-        if (self.cfg.train_data_file is None) or (not self.is_train):
-            # For OnlineForecastDataset, we should only reach here if no online dataset was provided
-            # In this case, we expect pre-processed NetCDF files that contain both hindcast and forecast data
-            raise ValueError("OnlineForecastDataset requires either an online_dataset parameter or pre-saved NetCDF files. "
-                           "Use the basin_forecasts_historical.ipynb workflow to create the online dataset first.") 
-
-        else:
-            # Otherwise we can reload previously-saved training data
+        # Check if we have pre-saved NetCDF training data to reload
+        if (self.cfg.train_data_file is not None) and self.cfg.train_data_file.exists():
+            LOGGER.info("Loading pre-saved training data from NetCDF file")
             with self.cfg.train_data_file.open("rb") as fp:
                 d = pickle.load(fp)
             xr_final = xr.Dataset.from_dict(d)
             if not self.frequencies:
                 native_frequency = utils.infer_frequency(xr_final["date"].values)
                 self.frequencies = [native_frequency]
-
-        return xr_final
+            return xr_final
+            
+        # If no online dataset provided and no pre-saved data, raise error
+        # CSV loading alone cannot provide forecast data with lead_time dimension
+        raise ValueError(
+            "OnlineForecastDataset requires either:\n"
+            "1. An 'online_dataset' parameter containing combined historical+forecast data "
+            "(from basin_forecasts_historical.ipynb workflow), OR\n"
+            "2. Pre-saved NetCDF files (cfg.train_data_file)\n\n"
+            "CSV files alone cannot provide forecast data with lead_time dimensions. "
+            "Use the basin_forecasts_historical.ipynb workflow to create the online dataset first."
+        )
 
     def _process_online_dataset(self, online_ds: xr.Dataset) -> xr.Dataset:
         """Process an online dataset to match expected structure and assign features correctly."""
@@ -243,6 +289,11 @@ class OnlineForecastDataset(GenericDataset):
         # This ensures that the _create_lookup_table method works correctly
         self.cfg.forecast_inputs = final_forecast_vars
         self.cfg.hindcast_inputs = [var for var in final_hindcast_vars if var not in self.cfg.target_variables]
+        
+        LOGGER.info("Successfully processed online dataset with:")
+        LOGGER.info(f"  - Historical data sources: CSV files + online dataset hindcast variables")
+        LOGGER.info(f"  - Forecast data sources: Online dataset forecast variables (with lead_time dimension)")
+        LOGGER.info(f"  - Data structure: Hindcast (basin, time) + Forecast (basin, time, lead_time)")
         
         return filtered_ds
 
