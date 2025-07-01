@@ -18,6 +18,7 @@ import logging
 import warnings
 import sys
 import pickle
+import os
 
 # from neuralhydrology.datasetzoo.basedataset import BaseDataset
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
@@ -35,17 +36,23 @@ class OnlineForecastDataset(GenericDataset):
     
     This dataset handles operational forecast data where:
     - Hindcast variables are indexed by (basin, time) only - loaded from local CSV files
-    - Forecast variables are indexed by (basin, time, lead_time) - loaded from online sources
+    - Forecast variables are indexed by (basin, time, lead_time) - loaded from online NOAA GEFS sources
     - Supports probabilistic forecasts with quartiles (q25, q50, q75)
 
     The dataset loads data from two sources:
     1. Historical data from local CSV files in data/harz/timeseries/hydromet_timeseries_{basin}.csv
-    2. Forecast data from online NOAA GEFS sources (or placeholder data for testing)
+    2. Forecast data from online NOAA GEFS 35-day forecast dataset with full pipeline:
+       - Loads ensemble forecasts from NOAA GEFS zarr store
+       - Computes ensemble quartiles (25th, 50th, 75th percentiles)
+       - Interpolates to hourly resolution for first 240 hours
+       - Extracts data for specific basin centroids
 
     Data structure:
     - Hindcast variables: shape (basin, time) - historical observations
     - Forecast variables: shape (basin, time, lead_time) - forecast ensemble quartiles
     - Mixed indexing allows operational forecasting workflows
+
+    Supported basins: DE1, DE2, DE3, DE4, DE5 (Harz reservoir catchments)
 
     Parameters
     ----------
@@ -521,6 +528,13 @@ def load_online_forecast_data_for_basin(data_dir: Path, basin: str, columns: lis
                                        start_date: str = None, end_date: str = None) -> pd.DataFrame:
     """Load forecast data from online NOAA GEFS dataset for a specific basin.
     
+    This function implements the full NOAA GEFS forecast loading pipeline:
+    1. Load basin centroid coordinates
+    2. Fetch forecasts from NOAA GEFS zarr dataset
+    3. Compute ensemble quartiles (q25, q50, q75)
+    4. Interpolate to hourly resolution
+    5. Return as MultiIndex DataFrame
+    
     Parameters
     ----------
     data_dir : Path
@@ -540,41 +554,190 @@ def load_online_forecast_data_for_basin(data_dir: Path, basin: str, columns: lis
         MultiIndex DataFrame with (time, lead_time) index containing forecast data
     """
     try:
-        # For now, return a simplified structure for testing
-        # TODO: Implement full online forecast loading from NOAA GEFS
-        
-        # Create empty MultiIndex DataFrame with proper structure
-        time_range = pd.date_range(
-            start=start_date or '2023-01-01', 
-            end=end_date or '2023-12-31', 
-            freq='H'
-        )[:100]  # Limit for testing
-        
-        lead_times = range(1, 241)  # 240 hour forecast horizon
-        
-        multi_index = pd.MultiIndex.from_product(
-            [time_range, lead_times], 
-            names=['time', 'lead_time']
+        # Import required modules
+        from neuralhydrology.datautils.fetch_basin_forecasts import (
+            load_basin_centroids, fetch_forecasts_for_basins, interpolate_to_hourly
         )
         
-        # Create DataFrame with requested columns filled with NaN for now
-        data = {}
-        for col in columns:
-            data[col] = np.full(len(multi_index), np.nan, dtype=np.float32)
+        # Load basin centroids
+        basin_centroids_file = data_dir / "harz" / "basin_centroids" / "basin_centroids.csv"
+        if not basin_centroids_file.exists():
+            LOGGER.error(f"Basin centroids file not found: {basin_centroids_file}")
+            return _create_empty_forecast_dataframe()
         
-        df = pd.DataFrame(data, index=multi_index)
+        centroids = load_basin_centroids(str(basin_centroids_file))
         
-        LOGGER.info(f"Created placeholder forecast data for basin {basin} with shape {df.shape}")
+        # Map basin names - the centroids file uses different naming convention
+        basin_name_mapping = {
+            'DE1': 'innerste_reservoir_catchment_Basin_0',
+            'DE2': 'oker_reservoir_catchment_Basin_0', 
+            'DE3': 'ecker_reservoir_catchment_Basin_0',
+            'DE4': 'soese_reservoir_catchment_Basin_0',
+            'DE5': 'grane_reservoir_catchment_Basin_0'
+        }
+        
+        if basin not in basin_name_mapping:
+            LOGGER.warning(f"Basin {basin} not found in basin mapping. Available basins: {list(basin_name_mapping.keys())}")
+            return _create_empty_forecast_dataframe()
+        
+        # Filter to specific basin
+        mapped_basin_name = basin_name_mapping[basin]
+        basin_centroid = centroids[centroids['basin_name'] == mapped_basin_name]
+        
+        if basin_centroid.empty:
+            LOGGER.warning(f"Centroid not found for mapped basin {mapped_basin_name}")
+            return _create_empty_forecast_dataframe()
+        
+        # Load NOAA GEFS dataset
+        LOGGER.info(f"Loading NOAA GEFS data for basin {basin}...")
+        zarr_url = "https://data.dynamical.org/noaa/gefs/forecast-35-day/latest.zarr?email=optional@email.com"
+        ds = xr.open_zarr(zarr_url, decode_timedelta=True)
+        LOGGER.info(f"NOAA GEFS dataset loaded successfully with dimensions: {dict(ds.dims)}")
+        
+        # Filter to date range if specified
+        if start_date and end_date:
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            ds = ds.sel(init_time=slice(start_dt, end_dt))
+            LOGGER.info(f"Filtered to date range: {start_date} to {end_date}")
+        
+        # Extract forecasts for the basin
+        LOGGER.info(f"Extracting forecasts for basin {basin} (mapped: {mapped_basin_name})...")
+        basin_forecasts = fetch_forecasts_for_basins(ds, basin_centroid, init_time=None)
+        LOGGER.info(f"Extracted forecasts with dimensions: {dict(basin_forecasts.dims)}")
+        
+        # Update basin coordinate to use DE1-DE5 naming for consistency
+        basin_forecasts = basin_forecasts.assign_coords(basin=[basin])
+        
+        # Compute quartiles as separate variables
+        LOGGER.info(f"Computing forecast quartiles (25th, 50th, 75th percentiles)...")
+        forecast_quartiles = compute_forecast_quartiles_as_variables(basin_forecasts)
+        LOGGER.info(f"Created {len(forecast_quartiles.data_vars)} quartile variables")
+        
+        # Interpolate to hourly resolution for first 240 hours (10 days)
+        LOGGER.info(f"Interpolating to hourly resolution for first 240 hours...")
+        forecast_hourly = interpolate_to_hourly(forecast_quartiles, max_hours=240)
+        LOGGER.info(f"Interpolated to {len(forecast_hourly.lead_time)} hourly lead time steps")
+        
+        # Convert to DataFrame with MultiIndex
+        LOGGER.info(f"Converting to DataFrame with MultiIndex (time, lead_time)...")
+        df = _convert_forecast_to_dataframe(forecast_hourly, basin, columns)
+        
+        LOGGER.info(f"✅ Successfully loaded forecast data for basin {basin}")
+        LOGGER.info(f"   Final DataFrame shape: {df.shape}")
+        LOGGER.info(f"   Available variables: {list(df.columns)}")
+        if not df.empty:
+            LOGGER.info(f"   Time range: {df.index.get_level_values('time').min()} to {df.index.get_level_values('time').max()}")
+            LOGGER.info(f"   Lead time range: {df.index.get_level_values('lead_time').min()} to {df.index.get_level_values('lead_time').max()} hours")
+        
         return df
         
     except Exception as e:
         LOGGER.error(f"Error loading forecast data for basin {basin}: {e}")
-        # Return empty MultiIndex DataFrame
-        multi_index = pd.MultiIndex.from_product(
-            [pd.DatetimeIndex([]), pd.Index([])], 
-            names=['time', 'lead_time']
-        )
-        return pd.DataFrame(index=multi_index)
+        return _create_empty_forecast_dataframe()
+
+
+def compute_forecast_quartiles_as_variables(forecast_ds: xr.Dataset, 
+                                          quartiles: list = [0.25, 0.5, 0.75]) -> xr.Dataset:
+    """Compute quartiles from ensemble forecast data as separate variables.
+    
+    Parameters
+    ----------
+    forecast_ds : xr.Dataset
+        Dataset with ensemble forecasts containing 'ensemble_member' dimension
+    quartiles : list, optional
+        List of quantiles to compute (default: [0.25, 0.5, 0.75])
+        
+    Returns
+    -------
+    xr.Dataset
+        Dataset with quartile variables (e.g., temperature_2m_q25, temperature_2m_q50, etc.)
+    """
+    quartile_suffixes = {0.25: '_q25', 0.5: '_q50', 0.75: '_q75'}
+    new_data_vars = {}
+    
+    for var_name in forecast_ds.data_vars:
+        if 'ensemble_member' not in forecast_ds[var_name].dims:
+            # Variable doesn't have ensemble dimension, keep as is
+            new_data_vars[var_name] = forecast_ds[var_name]
+            continue
+            
+        var_data = forecast_ds[var_name]
+        var_quartiles = var_data.quantile(quartiles, dim='ensemble_member')
+        
+        for i, q in enumerate(quartiles):
+            suffix = quartile_suffixes.get(q, f'_q{int(q*100)}')
+            new_var_name = f"{var_name}{suffix}"
+            quartile_data = var_quartiles.isel(quantile=i).drop('quantile')
+            new_data_vars[new_var_name] = quartile_data
+    
+    # Keep coordinates that don't have ensemble_member dimension
+    coords_to_keep = {k: v for k, v in forecast_ds.coords.items() 
+                     if 'ensemble_member' not in v.dims}
+    
+    return xr.Dataset(new_data_vars, coords=coords_to_keep, attrs=forecast_ds.attrs)
+
+
+def _convert_forecast_to_dataframe(forecast_ds: xr.Dataset, basin_name: str, columns: list) -> pd.DataFrame:
+    """Convert forecast xarray Dataset to pandas DataFrame with MultiIndex.
+    
+    Parameters
+    ----------
+    forecast_ds : xr.Dataset
+        Forecast dataset with time and lead_time dimensions
+    basin_name : str
+        Name of the basin
+    columns : list
+        List of variable columns to include
+        
+    Returns
+    -------
+    pd.DataFrame
+        MultiIndex DataFrame with (time, lead_time) index
+    """
+    # Select data for the specific basin
+    if 'basin' in forecast_ds.dims:
+        basin_data = forecast_ds.sel(basin=basin_name)
+    else:
+        basin_data = forecast_ds
+    
+    # Convert to DataFrame 
+    df = basin_data.to_dataframe()
+    
+    # Ensure we have the right index structure
+    if 'init_time' in df.index.names:
+        df = df.reset_index()
+        df = df.rename(columns={'init_time': 'time'})
+        df = df.set_index(['time', 'lead_time'])
+    elif df.index.names != ['time', 'lead_time']:
+        # Try to reconstruct proper MultiIndex
+        df = df.reset_index()
+        time_cols = [col for col in df.columns if 'time' in col.lower()]
+        lead_cols = [col for col in df.columns if 'lead' in col.lower()]
+        
+        if time_cols and lead_cols:
+            df = df.set_index([time_cols[0], lead_cols[0]])
+            df.index.names = ['time', 'lead_time']
+    
+    # Filter to requested columns
+    if columns:
+        available_vars = [var for var in columns if var in df.columns]
+        if available_vars:
+            df = df[available_vars]
+        else:
+            LOGGER.warning(f"No requested variables found in forecast data. Available: {list(df.columns)}")
+            return _create_empty_forecast_dataframe()
+    
+    return df
+
+
+def _create_empty_forecast_dataframe() -> pd.DataFrame:
+    """Create an empty DataFrame with proper MultiIndex structure for forecasts."""
+    multi_index = pd.MultiIndex.from_product(
+        [pd.DatetimeIndex([]), pd.Index([])], 
+        names=['time', 'lead_time']
+    )
+    return pd.DataFrame(index=multi_index)
 
 
 # Use the same validation function from the original ForecastDataset
