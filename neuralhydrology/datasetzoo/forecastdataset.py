@@ -80,13 +80,19 @@ class ForecastDataset(GenericDataset):
                  id_to_int: Dict[str, int] = {},
                  scaler: Dict[str, Union[pd.Series, xarray.DataArray]] = {}):
     
-        super(GenericDataset, self).__init__(cfg=cfg,
-                                             is_train=is_train,
-                                             period=period,
-                                             basin=basin,
-                                             additional_features=additional_features,
-                                             id_to_int=id_to_int,
-                                             scaler=scaler)
+        # Initialize forecast-specific attributes before calling parent constructor
+        self._x_h = {}
+        self._x_f = {}
+        self._y = {}
+        self._dates = {}
+    
+        super().__init__(cfg=cfg,
+                         is_train=is_train,
+                         period=period,
+                         basin=basin,
+                         additional_features=additional_features,
+                         id_to_int=id_to_int,
+                         scaler=scaler)
 
     def _load_basin_data(self, basin: str, columns: list) -> pd.DataFrame:
         """Load input and output data. """
