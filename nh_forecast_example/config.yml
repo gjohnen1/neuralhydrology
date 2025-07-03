@@ -231,6 +231,9 @@ dataset: forecast
 # Path to data set root
 data_dir: ./nh_forecast_example/camels_gb_graphcast_10d_sample
 
+# Path to the directory where the training data should be stored
+train_dir: ./nh_forecast_example/runs
+
 # Time series data subdirectory 
 time_series_data_sub_dir: pseudo
 
