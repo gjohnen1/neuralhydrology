@@ -196,7 +196,7 @@ predict_last_n: 240
 
 # Length of the input sequence
 # If use_frequencies is used, this needs to be a dict mapping each frequency to a seq_length, else an int.
-seq_length: 30
+seq_length: 720 # 30 days
 
 # Length of the forecast sequence 
 forecast_seq_length: 240
