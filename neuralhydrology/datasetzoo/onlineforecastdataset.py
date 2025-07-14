@@ -161,8 +161,35 @@ class OnlineForecastDataset(GenericDataset):
                 if 'init_time' in forecast_ds.dims:
                     forecast_ds = forecast_ds.rename({'init_time': 'time'})
                 
-                # Merge the datasets - xarray will automatically align coordinates
-                xr_dataset = xr.merge([historical_ds, forecast_ds], compat='override')
+                # Find merge period: start from forecast data begin, end at historical data end
+                forecast_start = forecast_ds['time'].min().values
+                forecast_end = forecast_ds['time'].max().values
+                historical_start = historical_ds['time'].min().values
+                historical_end = historical_ds['time'].max().values
+                
+                # Use your specified logic: forecast start to historical end
+                merge_start = forecast_start
+                merge_end = historical_end
+                
+                # Validate that the merge period makes sense
+                if merge_start > merge_end:
+                    LOGGER.warning(f"Forecast starts ({merge_start}) after historical ends ({merge_end})")
+                    LOGGER.warning("Using intersection period instead")
+                    merge_start = max(forecast_start, historical_start)
+                    merge_end = min(forecast_end, historical_end)
+                
+                LOGGER.info(f"Merge period: {merge_start} to {merge_end}")
+                LOGGER.info(f"  Based on: forecast start to historical end logic")
+                
+                # Align both datasets to the merge period  
+                forecast_aligned = forecast_ds.sel(time=slice(merge_start, merge_end))
+                historical_aligned = historical_ds.sel(time=slice(merge_start, merge_end))
+                
+                LOGGER.info(f"Aligned forecast data: {len(forecast_aligned.time)} time steps")
+                LOGGER.info(f"Aligned historical data: {len(historical_aligned.time)} time steps")
+                
+                # Merge the aligned datasets
+                xr_dataset = xr.merge([historical_aligned, forecast_aligned], compat='override')
                 
             elif forecast_ds is not None:
                 # Only forecast data available
