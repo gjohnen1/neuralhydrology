@@ -85,6 +85,9 @@ class OnlineForecastDataset(GenericDataset):
         self._x_h = {}
         self._x_f = {}
     
+        # Validate data availability before initializing
+        self._validate_data_availability(cfg)
+        
         super().__init__(cfg=cfg,
                          is_train=is_train,
                          period=period,
@@ -190,16 +193,6 @@ class OnlineForecastDataset(GenericDataset):
                 
                 # Merge the aligned datasets
                 xr_dataset = xr.merge([historical_aligned, forecast_aligned], compat='override')
-                
-            elif forecast_ds is not None:
-                # Only forecast data available
-                if 'init_time' in forecast_ds.dims:
-                    forecast_ds = forecast_ds.rename({'init_time': 'time'})
-                xr_dataset = forecast_ds
-                
-            elif historical_ds is not None:
-                # Only historical data available  
-                xr_dataset = historical_ds
                 
             else:
                 # No data available
@@ -644,6 +637,136 @@ class OnlineForecastDataset(GenericDataset):
                 raise NoTrainDataError
             else:
                 raise NoEvaluationDataError
+
+    def _validate_data_availability(self, cfg: Config):
+        """Validate that configured time periods are within available data ranges.
+        
+        This method checks that all configured train, validation, and test periods
+        fall within the available data ranges for both historical and forecast data:
+        
+        - Historical data: available until 2024-04-30 23:00:00
+        - Forecast data: available from 2020-10-01 00:00:00 onwards
+        
+        For periods that require both historical and forecast data, both constraints
+        must be satisfied.
+        
+        Parameters
+        ----------
+        cfg : Config
+            The run configuration containing time period definitions
+        
+        Raises
+        ------
+        ValueError
+            If any configured period extends outside available data ranges
+        """
+        # Define data availability constraints
+        historical_data_end = pd.to_datetime('2024-04-30 23:00:00')
+        forecast_data_start = pd.to_datetime('2020-10-01 00:00:00')
+        
+        LOGGER.info("Validating data availability against configured time periods...")
+        LOGGER.info(f"  Historical data available until: {historical_data_end}")
+        LOGGER.info(f"  Forecast data available from: {forecast_data_start}")
+        
+        # Collect all configured periods
+        periods_to_check = []
+        
+        # Check training period
+        if hasattr(cfg, 'train_start_date') and hasattr(cfg, 'train_end_date'):
+            if cfg.train_start_date and cfg.train_end_date:
+                train_start = pd.to_datetime(cfg.train_start_date, format='%d/%m/%Y')
+                train_end = pd.to_datetime(cfg.train_end_date, format='%d/%m/%Y')
+                periods_to_check.append(('train', train_start, train_end))
+        
+        # Check validation period  
+        if hasattr(cfg, 'validation_start_date') and hasattr(cfg, 'validation_end_date'):
+            if cfg.validation_start_date and cfg.validation_end_date:
+                val_start = pd.to_datetime(cfg.validation_start_date, format='%d/%m/%Y')
+                val_end = pd.to_datetime(cfg.validation_end_date, format='%d/%m/%Y')
+                periods_to_check.append(('validation', val_start, val_end))
+        
+        # Check test period
+        if hasattr(cfg, 'test_start_date') and hasattr(cfg, 'test_end_date'):
+            if cfg.test_start_date and cfg.test_end_date:
+                test_start = pd.to_datetime(cfg.test_start_date, format='%d/%m/%Y')
+                test_end = pd.to_datetime(cfg.test_end_date, format='%d/%m/%Y')
+                periods_to_check.append(('test', test_start, test_end))
+        
+        # Validate each period
+        errors = []
+        warnings = []
+        
+        for period_name, period_start, period_end in periods_to_check:
+            LOGGER.info(f"  Checking {period_name} period: {period_start.date()} to {period_end.date()}")
+            
+            # Check if period requires forecast data (overlaps with forecast availability)
+            needs_forecast_data = period_end >= forecast_data_start
+            
+            # Check if period requires historical data (starts before or overlaps with historical availability)
+            needs_historical_data = period_start <= historical_data_end
+            
+            # Validate forecast data availability
+            if needs_forecast_data and period_start < forecast_data_start:
+                gap_days = (forecast_data_start - period_start).days
+                errors.append(
+                    f"{period_name.capitalize()} period starts {gap_days} days before forecast data becomes available. "
+                    f"Period starts: {period_start.date()}, forecast data starts: {forecast_data_start.date()}"
+                )
+            
+            # Validate historical data availability  
+            if needs_historical_data and period_end > historical_data_end:
+                gap_days = (period_end - historical_data_end).days
+                errors.append(
+                    f"{period_name.capitalize()} period extends {gap_days} days beyond available historical data. "
+                    f"Period ends: {period_end.date()}, historical data ends: {historical_data_end.date()}"
+                )
+            
+            # Check for periods that fall entirely outside available data ranges
+            if period_end < forecast_data_start and period_start > historical_data_end:
+                errors.append(
+                    f"{period_name.capitalize()} period falls entirely outside available data ranges. "
+                    f"Period: {period_start.date()} to {period_end.date()}"
+                )
+            
+            # For OnlineForecastDataset, periods without forecast data are considered errors
+            # since this dataset is specifically designed for forecast operations
+            if period_end < forecast_data_start and needs_historical_data:
+                gap_days = (forecast_data_start - period_end).days
+                errors.append(
+                    f"{period_name.capitalize()} period ends {gap_days} days before forecast data becomes available. "
+                    f"OnlineForecastDataset requires forecast data availability. "
+                    f"Period ends: {period_end.date()}, forecast data starts: {forecast_data_start.date()}"
+                )
+            
+            # Also error for periods that start after historical data ends (no historical context)
+            if period_start > historical_data_end:
+                gap_days = (period_start - historical_data_end).days
+                errors.append(
+                    f"{period_name.capitalize()} period starts {gap_days} days after historical data ends. "
+                    f"No historical context available for model training/evaluation. "
+                    f"Period starts: {period_start.date()}, historical data ends: {historical_data_end.date()}"
+                )
+        
+        # Log warnings
+        for warning in warnings:
+            LOGGER.warning(f"⚠️  {warning}")
+        
+        # Raise errors if any validation failed
+        if errors:
+            error_msg = "Data availability validation failed:\n\n"
+            for i, error in enumerate(errors, 1):
+                error_msg += f"{i}. {error}\n"
+            
+            error_msg += f"\nAvailable data ranges:\n"
+            error_msg += f"  • Historical data: up to {historical_data_end.date()} {historical_data_end.time()}\n"
+            error_msg += f"  • Forecast data: from {forecast_data_start.date()} {forecast_data_start.time()} onwards\n\n"
+            error_msg += f"Suggested fixes:\n"
+            error_msg += f"  • Adjust configured date ranges to fall within available data periods\n"
+            error_msg += f"  • Update data sources to extend availability ranges"
+            
+            raise ValueError(error_msg)
+        
+        LOGGER.info("✅ Data availability validation passed - all periods fall within available data ranges")
 
     def _validate_forecast_archive_availability(self):
         """Validate that training, validation, and test periods don't extend before NOAA GEFS archive availability.
