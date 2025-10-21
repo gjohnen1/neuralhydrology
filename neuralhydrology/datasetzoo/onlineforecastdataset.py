@@ -84,8 +84,7 @@ class OnlineForecastDataset(GenericDataset):
     
         # Validate data availability before initializing
         self._validate_data_availability(cfg)
-        self._initialize_frequency_configuration()
-        
+
         super().__init__(cfg=cfg,
                          is_train=is_train,
                          period=period,
