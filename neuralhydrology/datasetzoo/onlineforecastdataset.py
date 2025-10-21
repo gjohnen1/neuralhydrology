@@ -1,8 +1,6 @@
 # import re
 # from collections import defaultdict
-from typing import List, Dict, Union
-from functools import reduce
-from pathlib import Path
+from typing import List, Dict, Union, Tuple
 # from pandas.tseries import frequencies
 from pandas.tseries.frequencies import to_offset
 from numba import NumbaPendingDeprecationWarning
@@ -18,7 +16,6 @@ import logging
 import warnings
 import sys
 import pickle
-import os
 
 # from neuralhydrology.datasetzoo.basedataset import BaseDataset
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
@@ -87,6 +84,7 @@ class OnlineForecastDataset(GenericDataset):
     
         # Validate data availability before initializing
         self._validate_data_availability(cfg)
+        self._initialize_frequency_configuration()
         
         super().__init__(cfg=cfg,
                          is_train=is_train,
@@ -95,31 +93,6 @@ class OnlineForecastDataset(GenericDataset):
                          additional_features=additional_features,
                          id_to_int=id_to_int,
                          scaler=scaler)
-
-    def _load_basin_data(self, basin: str, columns: list) -> pd.DataFrame:
-        """Load input and output data for a specific basin."""
-        # This method should not be used directly - instead use _load_hindcast_data or _load_forecast_data
-        raise NotImplementedError("Use _load_hindcast_data or _load_forecast_data instead")
-    
-    def _load_hindcast_data(self, basin: str, columns: list) -> pd.DataFrame:
-        """Load historical/hindcast data for a specific basin from local CSV files."""
-        return load_local_historical_data_for_basin(
-            data_dir=self.cfg.data_dir,
-            basin=basin,
-            columns=columns,
-            start_date=getattr(self.cfg, 'forecast_start_date', None),
-            end_date=getattr(self.cfg, 'forecast_end_date', None)
-        )
-    
-    def _load_forecast_data(self, basin: str, columns: list) -> pd.DataFrame:
-        """Load forecast data for a specific basin from online sources."""
-        return load_online_forecast_data_for_basin(
-            data_dir=self.cfg.data_dir,
-            basin=basin,
-            columns=columns,
-            start_date=getattr(self.cfg, 'forecast_start_date', None),
-            end_date=getattr(self.cfg, 'forecast_end_date', None)
-        )
 
     def _initialize_frequency_configuration(self):
         """Checks and extracts configuration values for 'use_frequency', 'seq_length', and 'predict_last_n'"""
@@ -146,69 +119,124 @@ class OnlineForecastDataset(GenericDataset):
     def _load_or_create_xarray_dataset(self) -> xr.Dataset:
         # if no netCDF file is passed, data set is created from raw basin files and online sources
         if (self.cfg.train_data_file is None) or (not self.is_train):
-            
+
             if not self._disable_pbar:
                 LOGGER.info("Loading basin data into xarray data set using direct xarray approach.")
-            
-            # Load forecast data as xarray dataset (similar to operational notebook approach)
+
             forecast_ds = self._load_forecast_xarray_data()
-            
-            # Load historical data as xarray dataset 
             historical_ds = self._load_historical_xarray_data()
-            
-            # Merge forecast and historical datasets
-            if forecast_ds is not None and historical_ds is not None:
-                LOGGER.info("Merging forecast and historical datasets...")
-                
-                # Handle coordinate alignment - rename init_time to time in forecast data if needed
-                if 'init_time' in forecast_ds.dims:
-                    forecast_ds = forecast_ds.rename({'init_time': 'time'})
-                
-                # Find merge period: use intersection of both datasets
-                forecast_start = forecast_ds['time'].min().values
-                forecast_end = forecast_ds['time'].max().values
-                historical_start = historical_ds['time'].min().values
-                historical_end = historical_ds['time'].max().values
-                
-                # Use intersection period where both datasets have data
-                merge_start = max(forecast_start, historical_start)
-                merge_end = min(forecast_end, historical_end)
-                
-                # Validate that the merge period makes sense
-                if merge_start > merge_end:
-                    LOGGER.warning(f"No overlap between forecast ({forecast_start} to {forecast_end}) and historical ({historical_start} to {historical_end}) data")
-                    raise ValueError("No temporal overlap between forecast and historical datasets")
-                
-                LOGGER.info(f"Merge period: {merge_start} to {merge_end}")
-                LOGGER.info(f"  Based on: intersection of forecast and historical data availability")
-                
-                # Align both datasets to the merge period  
-                forecast_aligned = forecast_ds.sel(time=slice(merge_start, merge_end))
-                historical_aligned = historical_ds.sel(time=slice(merge_start, merge_end))
-                
-                LOGGER.info(f"Aligned forecast data: {len(forecast_aligned.time)} time steps")
-                LOGGER.info(f"Aligned historical data: {len(historical_aligned.time)} time steps")
-                
-                # Merge the aligned datasets
-                xr_dataset = xr.merge([historical_aligned, forecast_aligned], compat='override')
-                
-            else:
-                # No data available
+
+            if forecast_ds is None or historical_ds is None:
                 if self.is_train:
                     raise NoTrainDataError
-                else:
-                    raise NoEvaluationDataError
+                raise NoEvaluationDataError
 
-            
-            # Apply temporal slicing, warmup, and frequency handling
-            xr_dataset = self._apply_temporal_processing(xr_dataset)
-            
-            # Save training data if requested
+            if 'init_time' in forecast_ds.dims:
+                forecast_ds = forecast_ds.rename({'init_time': 'time'})
+
+            # ensure time dimension is available on both datasets
+            if 'time' not in forecast_ds.dims or 'time' not in historical_ds.dims:
+                raise ValueError('Both forecast and historical datasets must provide a time dimension.')
+
+            if not self.frequencies:
+                inferred_freq = utils.infer_frequency(historical_ds['time'].values)
+                if inferred_freq is None:
+                    raise ValueError('Could not infer native frequency from historical dataset.')
+                self.frequencies = [inferred_freq]
+
+            offsets = [(self.seq_len[i] - max(self._predict_last_n[i], self._forecast_seq_len[i])) * to_offset(freq)
+                       for i, freq in enumerate(self.frequencies)]
+
+            basin_datasets = []
+            basins_without_data: List[str] = []
+
+            for basin in self.basins:
+                if 'basin' not in historical_ds.coords or basin not in historical_ds['basin'].values:
+                    LOGGER.warning(f"Historical data not available for basin {basin} - skipping.")
+                    basins_without_data.append(basin)
+                    continue
+                if 'basin' not in forecast_ds.coords or basin not in forecast_ds['basin'].values:
+                    LOGGER.warning(f"Forecast data not available for basin {basin} - skipping.")
+                    basins_without_data.append(basin)
+                    continue
+                if basin not in self.start_and_end_dates:
+                    LOGGER.warning(f"No temporal configuration found for basin {basin} - skipping.")
+                    basins_without_data.append(basin)
+                    continue
+
+                hist_basin = historical_ds.sel(basin=basin, drop=False)
+                fcst_basin = forecast_ds.sel(basin=basin, drop=False)
+
+                native_frequency = utils.infer_frequency(hist_basin['time'].values)
+                if native_frequency is None:
+                    native_frequency = self.frequencies[0]
+
+                start_dates = self.start_and_end_dates[basin]["start_dates"]
+                end_dates = [date + pd.Timedelta(days=1, seconds=-1)
+                             for date in self.start_and_end_dates[basin]["end_dates"]]
+
+                hist_slices = []
+                fcst_slices = []
+
+                for start_date, end_date in zip(start_dates, end_dates):
+                    warmup_start = min(start_date - offset for offset in offsets)
+
+                    full_hist_index = pd.date_range(start=warmup_start,
+                                                    end=end_date,
+                                                    freq=native_frequency)
+                    period_index = pd.date_range(start=start_date,
+                                                 end=end_date,
+                                                 freq=native_frequency)
+
+                    hist_slice = hist_basin.sel(time=slice(warmup_start, end_date))
+                    hist_slice = hist_slice.reindex({'time': full_hist_index})
+
+                    fcst_slice = fcst_basin.sel(time=slice(start_date, end_date))
+                    fcst_slice = fcst_slice.reindex({'time': period_index})
+
+                    warmup_mask = hist_slice['time'] < np.datetime64(start_date)
+                    for target_var in self.cfg.target_variables:
+                        if target_var in hist_slice.data_vars:
+                            hist_slice[target_var] = hist_slice[target_var].where(~warmup_mask, np.nan)
+
+                    hist_slices.append(hist_slice)
+                    fcst_slices.append(fcst_slice)
+
+                if not hist_slices or not fcst_slices:
+                    LOGGER.warning(f"No temporal slices created for basin {basin} - skipping.")
+                    basins_without_data.append(basin)
+                    continue
+
+                hist_combined = xr.concat(hist_slices, dim='time').sortby('time')
+                fcst_combined = xr.concat(fcst_slices, dim='time').sortby('time')
+
+                hist_index = pd.Index(hist_combined['time'].values)
+                if hist_index.duplicated().any():
+                    keep_mask = ~hist_index.duplicated(keep='last')
+                    hist_combined = hist_combined.isel(time=keep_mask)
+
+                fcst_index = pd.Index(fcst_combined['time'].values)
+                if fcst_index.duplicated().any():
+                    keep_mask = ~fcst_index.duplicated(keep='last')
+                    fcst_combined = fcst_combined.isel(time=keep_mask)
+
+                basin_dataset = xr.merge([hist_combined, fcst_combined], compat='override')
+                basin_datasets.append(basin_dataset)
+
+            if basins_without_data:
+                LOGGER.info(f"Skipped basins without complete data: {sorted(set(basins_without_data))}")
+
+            if not basin_datasets:
+                if self.is_train:
+                    raise NoTrainDataError
+                raise NoEvaluationDataError
+
+            xr_dataset = xr.concat(basin_datasets, dim='basin')
+
             if self.is_train and self.cfg.save_train_data:
                 self._save_xarray_dataset(xr_dataset)
 
         else:
-            # Reload previously-saved training data
             with self.cfg.train_data_file.open("rb") as fp:
                 d = pickle.load(fp)
             xr_dataset = xr.Dataset.from_dict(d)
@@ -278,18 +306,11 @@ class OnlineForecastDataset(GenericDataset):
     def _load_historical_xarray_data(self) -> xr.Dataset:
         """Load historical data directly as xarray dataset."""
         try:
-            LOGGER.info("Loading historical data from local CSV files...")
+            LOGGER.info("Loading all available historical data from local CSV files...")
             
-            # Get date range from config or use defaults
-            start_date = getattr(self.cfg, 'train_start_date', '2000-01-01')
-            end_date = getattr(self.cfg, 'train_end_date', '2023-12-31')
+            # Load ALL available data - don't constrain by period dates
+            # The warmup calculation will handle temporal slicing later
             
-            # Convert to datetime if needed
-            if hasattr(start_date, 'strftime'):
-                start_date = start_date.strftime('%Y-%m-%d')
-            if hasattr(end_date, 'strftime'):
-                end_date = end_date.strftime('%Y-%m-%d')
-                
             basin_data = {}
             basin_names = []
             
@@ -304,34 +325,24 @@ class OnlineForecastDataset(GenericDataset):
                     LOGGER.warning(f"File not found for basin {basin}: {csv_file}")
                     continue
                     
-                LOGGER.info(f"Loading data for basin {basin} from {csv_file}")
+                LOGGER.info(f"Loading all available data for basin {basin} from {csv_file}")
                 
-                # Read CSV file
+                # Read CSV file - NO DATE FILTERING
                 df = pd.read_csv(csv_file)
                 df['date'] = pd.to_datetime(df['date'])
                 
-                # Filter to requested date range
-                start_dt = pd.to_datetime(start_date)
-                end_dt = pd.to_datetime(end_date)
-                mask = (df['date'] >= start_dt) & (df['date'] <= end_dt)
-                df_filtered = df[mask].copy()
-                
-                if df_filtered.empty:
-                    LOGGER.warning(f"No data in date range for basin {basin}")
-                    continue
-                    
                 # Set date as index and sort
-                df_filtered = df_filtered.set_index('date').sort_index()
+                df = df.set_index('date').sort_index()
                 
                 # Filter to only include hindcast_inputs and target_variables from config
-                available_cols = df_filtered.columns.tolist()
+                available_cols = df.columns.tolist()
                 wanted_cols = self.cfg.hindcast_inputs + self.cfg.target_variables
                 keep_cols = [col for col in wanted_cols if col in available_cols]
                 
                 if keep_cols:
-                    df_filtered = df_filtered[keep_cols]
-                    basin_data[basin] = df_filtered
-                    LOGGER.info(f"Loaded {len(df_filtered)} records for basin {basin} with variables: {keep_cols}")
+                    df = df[keep_cols]
+                    basin_data[basin] = df
+                    LOGGER.info(f"Loaded {len(df)} records for basin {basin} covering {df.index.min().date()} to {df.index.max().date()}")
                 else:
                     LOGGER.warning(f"No requested variables found for basin {basin}")
             
@@ -374,9 +385,6 @@ class OnlineForecastDataset(GenericDataset):
             # Create Dataset
             historical_ds = xr.Dataset(data_vars, coords=coords)
             
-            # Add attributes
-            historical_ds.attrs['source'] = 'Local CSV files'
-            historical_ds.attrs['date_range'] = f"{start_date} to {end_date}"
             
             LOGGER.info(f"Created historical dataset with {len(basin_names)} basins, {len(all_times)} time steps, and variables: {variable_names}")
             return historical_ds
@@ -385,8 +393,10 @@ class OnlineForecastDataset(GenericDataset):
             LOGGER.warning(f"Error loading historical data: {e}")
             return None
             
-    def _compute_forecast_quartiles_as_variables(self, forecast_ds, quartiles=[0.25, 0.5, 0.75]):
-        """Compute quartiles from ensemble forecast data as separate variables."""
+    def _compute_forecast_quartiles_as_variables(self,
+                                                 forecast_ds: xr.Dataset,
+                                                 quartiles: Tuple[float, ...] = (0.25, 0.5, 0.75)) -> xr.Dataset:
+        """Compute requested ensemble quartiles as standalone forecast variables."""
         LOGGER.info(f"Computing quartiles {quartiles} from ensemble forecasts as separate variables...")
         
         # Define quartile suffixes
@@ -415,7 +425,7 @@ class OnlineForecastDataset(GenericDataset):
                 quartile_data = var_quartiles.isel(quantile=i).drop('quantile')
                 
                 # Add to new data variables
-                new_data_vars[new_var_name] = quartile_data
+        new_data_vars[new_var_name] = quartile_data
         
         # Create new dataset with the same coordinates (excluding ensemble_member)
         coords_to_keep = {k: v for k, v in forecast_ds.coords.items() if 'ensemble_member' not in v.dims}
@@ -433,65 +443,6 @@ class OnlineForecastDataset(GenericDataset):
         
         return quartile_ds
         
-    def _apply_temporal_processing(self, xr_dataset: xr.Dataset) -> xr.Dataset:
-        """Apply temporal slicing, warmup periods, and frequency handling to the dataset."""
-        
-        # Infer native frequency from time coordinate
-        time_coord = 'time' if 'time' in xr_dataset.dims else 'date'
-        native_frequency = utils.infer_frequency(xr_dataset[time_coord].values)
-        if not self.frequencies:
-            self.frequencies = [native_frequency]
-        
-        # Get temporal periods for processing
-        processed_datasets = []
-        
-        for basin in self.basins:
-            if basin not in xr_dataset.basin.values:
-                continue
-                
-            basin_ds = xr_dataset.sel(basin=basin)
-            
-            # Get start and end dates for this basin
-            start_dates = self.start_and_end_dates[basin]["start_dates"]
-            end_dates = [
-                date + pd.Timedelta(days=1, seconds=-1) for date in self.start_and_end_dates[basin]["end_dates"]
-            ]
-            
-            # Calculate warmup offsets
-            offsets = [(self.seq_len[i] - max(self._predict_last_n[i], self._forecast_seq_len[i])) * to_offset(freq)
-                       for i, freq in enumerate(self.frequencies)]
-            
-            basin_slices = []
-            
-            # Process each temporal slice
-            for start_date, end_date in zip(start_dates, end_dates):
-                # Add warmup period
-                warmup_start_date = min(start_date - offset for offset in offsets)
-                
-                # Select time range
-                time_slice = basin_ds.sel({time_coord: slice(warmup_start_date, end_date)})
-                
-                # Set targets in warmup period to NaN
-                for target_var in self.cfg.target_variables:
-                    if target_var in time_slice.data_vars:
-                        warmup_mask = time_slice[time_coord] < start_date
-                        time_slice[target_var] = time_slice[target_var].where(~warmup_mask, np.nan)
-                
-                basin_slices.append(time_slice)
-            
-            if basin_slices:
-                # Concatenate temporal slices
-                basin_combined = xr.concat(basin_slices, dim=time_coord)
-                basin_combined = basin_combined.assign_coords(basin=basin)
-                processed_datasets.append(basin_combined)
-        
-        if processed_datasets:
-            # Combine all basins
-            final_dataset = xr.concat(processed_datasets, dim="basin")
-            return final_dataset
-        else:
-            return xr_dataset
-
     def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
         basin, indices = self.lookup_table[item]
 
@@ -537,62 +488,82 @@ class OnlineForecastDataset(GenericDataset):
         if not self._disable_pbar:
             LOGGER.info("Create lookup table and convert to pytorch tensor")
 
-        # Split data into forecast and hindcast components
-        xr_fcst = xr_dataset[self.cfg.forecast_inputs]
-        xr_hcst = xr_dataset[[var for var in xr_dataset.variables if var not in self.cfg.forecast_inputs]]
-        
-        # Drop lead_time dimension from hindcast data if it exists
+        forecast_vars = [var for var in self.cfg.forecast_inputs if var in xr_dataset.data_vars]
+        if not forecast_vars:
+            raise ValueError('Configured cfg.forecast_inputs are missing from the merged dataset.')
+
+        xr_fcst = xr_dataset[forecast_vars]
+
+        hindcast_vars = [var for var in xr_dataset.data_vars if var not in forecast_vars]
+        if not hindcast_vars:
+            raise ValueError('Dataset does not contain any hindcast or target variables after removing cfg.forecast_inputs.')
+
+        xr_hcst = xr_dataset[hindcast_vars]
+
         if 'lead_time' in xr_hcst.dims:
             xr_hcst = xr_hcst.drop_dims('lead_time')
 
-        # Use 'time' as the time dimension name (instead of 'date')
         time_dim = 'time' if 'time' in xr_hcst.dims else 'date'
 
         basins_without_samples = []
-        basin_coordinates = xr_hcst["basin"].values.tolist()
-        
+        basin_coordinates = xr_hcst['basin'].values.tolist()
+
         for basin in tqdm(basin_coordinates, file=sys.stdout, disable=self._disable_pbar):
             x_h, x_f, x_s, y, dates = {}, {}, {}, {}, {}
             frequency_maps = {}
             lowest_freq = utils.sort_frequencies(self.frequencies)[0]
 
-            # Convert to pandas DataFrame for easier handling
-            df_hcst_native = xr_hcst.sel(basin=basin, drop=True).to_dataframe()
-            df_fcst_native = xr_fcst.sel(basin=basin, drop=True).to_dataframe()
+            basin_hcst = xr_hcst.sel(basin=basin, drop=True)
+            basin_fcst = xr_fcst.sel(basin=basin, drop=True)
+
+            if time_dim not in basin_hcst.dims:
+                LOGGER.warning(f"Time dimension not found for basin {basin} - skipping.")
+                basins_without_samples.append(basin)
+                continue
 
             for freq in self.frequencies:
-                # No resampling - use native resolution
-                df_hcst_resampled = df_hcst_native
-                df_fcst_resampled = df_fcst_native
-            
-                # Extract hindcast inputs
-                x_h[freq] = df_hcst_resampled[self.cfg.hindcast_inputs].values
-                
-                # Extract forecast inputs - handle MultiIndex properly
-                if isinstance(df_fcst_resampled.index, pd.MultiIndex):
-                    # Convert MultiIndex DataFrame to 3D array: (time, lead_time, variables)
-                    fcst_xr = df_fcst_resampled[self.cfg.forecast_inputs].to_xarray()
-                    x_f[freq] = fcst_xr.to_array().transpose('time', 'lead_time', 'variable').values
+                available_hindcast = [var for var in self.cfg.hindcast_inputs if var in basin_hcst.data_vars]
+                if not available_hindcast:
+                    raise ValueError(f'No hindcast inputs available for basin {basin}. Check cfg.hindcast_inputs.')
+
+                hc_inputs = basin_hcst[available_hindcast]
+                x_h_array = hc_inputs.to_array('variable').transpose(time_dim, 'variable').values
+                x_h[freq] = x_h_array
+
+                available_forecast = [var for var in self.cfg.forecast_inputs if var in basin_fcst.data_vars]
+                if not available_forecast:
+                    raise ValueError(f'No forecast inputs available for basin {basin}. Check cfg.forecast_inputs.')
+
+                fc_inputs = basin_fcst[available_forecast]
+                fc_array = fc_inputs.to_array('variable')
+                if 'lead_time' in fc_array.dims:
+                    fc_array = fc_array.transpose(time_dim, 'lead_time', 'variable').values
                 else:
-                    x_f[freq] = df_fcst_resampled[self.cfg.forecast_inputs].values
-                
-                # Extract targets from hindcast data
-                y[freq] = df_hcst_resampled[self.cfg.target_variables].values
-                
-                # Store dates
-                dates[freq] = df_hcst_resampled.index.to_numpy()
+                    # Keep forecast tensors three-dimensional even without lead_time information.
+                    fc_array = fc_array.transpose(time_dim, 'variable').values[:, np.newaxis, :]
+                x_f[freq] = fc_array
 
-                # Create frequency mapping
+                available_targets = [var for var in self.cfg.target_variables if var in basin_hcst.data_vars]
+                if not available_targets:
+                    raise ValueError(f'No target variables available for basin {basin}. Check cfg.target_variables.')
+
+                target_da = basin_hcst[available_targets]
+                y_array = target_da.to_array('variable').transpose(time_dim, 'variable').values
+                y[freq] = y_array
+
+                dates[freq] = basin_hcst[time_dim].values
+
+                n_time = x_h[freq].shape[0]
                 frequency_factor = int(utils.get_frequency_factor(lowest_freq, freq))
-                if len(df_hcst_resampled) % frequency_factor != 0:
-                    raise ValueError(f'The length of the dataframe at frequency {freq} is {len(df_hcst_resampled)} '
+                if frequency_factor <= 0:
+                    raise ValueError(f'Invalid frequency factor {frequency_factor} derived from {freq} relative to {lowest_freq}.')
+                if n_time % frequency_factor != 0:
+                    raise ValueError(f'The length of the sequence at frequency {freq} is {n_time} '
                                      f'(including warmup), which is not a multiple of {frequency_factor}.')
-                frequency_maps[freq] = np.arange(len(df_hcst_resampled) // frequency_factor) \
-                                       * frequency_factor + (frequency_factor - 1)
+                frequency_maps[freq] = np.arange(n_time // frequency_factor) * frequency_factor + (frequency_factor - 1)
 
-            # Store period start for inference
             if not self.is_train:
-                self.period_starts[basin] = pd.to_datetime(xr_hcst.sel(basin=basin)[time_dim].values[0])
+                self.period_starts[basin] = pd.to_datetime(basin_hcst[time_dim].values[0])
 
             # Validate samples
             with warnings.catch_warnings():
@@ -820,283 +791,6 @@ class OnlineForecastDataset(GenericDataset):
             
             LOGGER.error(error_msg)
             raise ValueError(error_msg)
-
-def load_local_historical_data_for_basin(data_dir: Path, basin: str, columns: list, 
-                                        start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """Load historical data from local CSV files for a specific basin.
-    
-    Parameters
-    ----------
-    data_dir : Path
-        Path to the data directory containing harz data
-    basin : str
-        The basin identifier (e.g., 'DE1', 'DE2', etc.)
-    columns : list
-        List of variable names to extract
-    start_date : str, optional
-        Start date for data loading (YYYY-MM-DD format)
-    end_date : str, optional
-        End date for data loading (YYYY-MM-DD format)
-        
-    Returns
-    -------
-    pd.DataFrame
-        Time-indexed DataFrame containing historical data
-    """
-    timeseries_dir = data_dir / "harz" / "timeseries"
-    csv_file = timeseries_dir / f"hydromet_timeseries_{basin}.csv"
-    
-    if not csv_file.exists():
-        LOGGER.warning(f"Historical data file not found for basin {basin}: {csv_file}")
-        return pd.DataFrame(index=pd.DatetimeIndex([], name='time'))
-    
-    try:
-        # Read CSV file
-        df = pd.read_csv(csv_file)
-        df['date'] = pd.to_datetime(df['date'])
-        
-        # Filter to date range if specified
-        if start_date and end_date:
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date)
-            mask = (df['date'] >= start_dt) & (df['date'] <= end_dt)
-            df = df[mask]
-        
-        # Set date as index and rename to 'time' for consistency
-        df = df.set_index('date').sort_index()
-        df.index.name = 'time'
-        
-        # Filter to requested variables if specified
-        if columns:
-            available_vars = [var for var in columns if var in df.columns]
-            if available_vars:
-                df = df[available_vars]
-            else:
-                LOGGER.warning(f"No requested variables found in historical data for basin {basin}")
-                return pd.DataFrame(index=pd.DatetimeIndex([], name='time'))
-        
-        return df
-        
-    except Exception as e:
-        LOGGER.error(f"Error loading historical data for basin {basin}: {e}")
-        return pd.DataFrame(index=pd.DatetimeIndex([], name='time'))
-
-
-def load_online_forecast_data_for_basin(data_dir: Path, basin: str, columns: list,
-                                       start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """Load forecast data from online NOAA GEFS dataset for a specific basin.
-    
-    This function implements the full NOAA GEFS forecast loading pipeline:
-    1. Load basin centroid coordinates
-    2. Fetch forecasts from NOAA GEFS zarr dataset
-    3. Compute ensemble quartiles (q25, q50, q75)
-    4. Interpolate to hourly resolution
-    5. Return as MultiIndex DataFrame
-    
-    Parameters
-    ----------
-    data_dir : Path
-        Path to the data directory (used to find basin metadata)
-    basin : str
-        The basin identifier (e.g., 'DE1', 'DE2', etc.)
-    columns : list
-        List of forecast variable names to extract
-    start_date : str, optional
-        Start date for data loading (YYYY-MM-DD format)
-    end_date : str, optional
-        End date for data loading (YYYY-MM-DD format)
-        
-    Returns
-    -------
-    pd.DataFrame
-        MultiIndex DataFrame with (time, lead_time) index containing forecast data
-    """
-    try:
-        # Import required modules
-        from neuralhydrology.datautils.fetch_basin_forecasts import (
-            load_basin_centroids, fetch_forecasts_for_basins, interpolate_to_hourly
-        )
-        
-        # Load basin centroids
-        basin_centroids_file = data_dir / "harz" / "basin_centroids" / "basin_centroids.csv"
-        if not basin_centroids_file.exists():
-            LOGGER.error(f"Basin centroids file not found: {basin_centroids_file}")
-            return _create_empty_forecast_dataframe()
-        
-        centroids = load_basin_centroids(str(basin_centroids_file))
-        
-        # Map basin names - the centroids file uses different naming convention
-        basin_name_mapping = {
-            'DE1': 'innerste_reservoir_catchment_Basin_0',
-            'DE2': 'oker_reservoir_catchment_Basin_0', 
-            'DE3': 'ecker_reservoir_catchment_Basin_0',
-            'DE4': 'soese_reservoir_catchment_Basin_0',
-            'DE5': 'grane_reservoir_catchment_Basin_0'
-        }
-        
-        if basin not in basin_name_mapping:
-            LOGGER.warning(f"Basin {basin} not found in basin mapping. Available basins: {list(basin_name_mapping.keys())}")
-            return _create_empty_forecast_dataframe()
-        
-        # Filter to specific basin
-        mapped_basin_name = basin_name_mapping[basin]
-        basin_centroid = centroids[centroids['basin_name'] == mapped_basin_name]
-        
-        if basin_centroid.empty:
-            LOGGER.warning(f"Centroid not found for mapped basin {mapped_basin_name}")
-            return _create_empty_forecast_dataframe()
-        
-        # Load NOAA GEFS dataset
-        LOGGER.info(f"Loading NOAA GEFS data for basin {basin}...")
-        zarr_url = "https://data.dynamical.org/noaa/gefs/forecast-35-day/latest.zarr?email=optional@email.com"
-        ds = xr.open_zarr(zarr_url, decode_timedelta=True)
-        LOGGER.info(f"NOAA GEFS dataset loaded successfully with dimensions: {dict(ds.dims)}")
-        
-        # Filter to date range if specified
-        if start_date and end_date:
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date)
-            ds = ds.sel(init_time=slice(start_dt, end_dt))
-            LOGGER.info(f"Filtered to date range: {start_date} to {end_date}")
-        
-        # Extract forecasts for the basin
-        LOGGER.info(f"Extracting forecasts for basin {basin} (mapped: {mapped_basin_name})...")
-        basin_forecasts = fetch_forecasts_for_basins(ds, basin_centroid, init_time=None)
-        LOGGER.info(f"Extracted forecasts with dimensions: {dict(basin_forecasts.dims)}")
-        
-        # Update basin coordinate to use DE1-DE5 naming for consistency
-        basin_forecasts = basin_forecasts.assign_coords(basin=[basin])
-        
-        # Compute quartiles as separate variables
-        LOGGER.info(f"Computing forecast quartiles (25th, 50th, 75th percentiles)...")
-        forecast_quartiles = compute_forecast_quartiles_as_variables(basin_forecasts)
-        LOGGER.info(f"Created {len(forecast_quartiles.data_vars)} quartile variables")
-        
-        # Interpolate to hourly resolution for first 240 hours (10 days)
-        LOGGER.info(f"Interpolating to hourly resolution for first 240 hours...")
-        forecast_hourly = interpolate_to_hourly(forecast_quartiles, max_hours=240)
-        LOGGER.info(f"Interpolated to {len(forecast_hourly.lead_time)} hourly lead time steps")
-        
-        # Convert to DataFrame with MultiIndex
-        LOGGER.info(f"Converting to DataFrame with MultiIndex (time, lead_time)...")
-        df = _convert_forecast_to_dataframe(forecast_hourly, basin, columns)
-        
-        LOGGER.info(f"✅ Successfully loaded forecast data for basin {basin}")
-        LOGGER.info(f"   Final DataFrame shape: {df.shape}")
-        LOGGER.info(f"   Available variables: {list(df.columns)}")
-        if not df.empty:
-            LOGGER.info(f"   Time range: {df.index.get_level_values('time').min()} to {df.index.get_level_values('time').max()}")
-            LOGGER.info(f"   Lead time range: {df.index.get_level_values('lead_time').min()} to {df.index.get_level_values('lead_time').max()} hours")
-        
-        return df
-        
-    except Exception as e:
-        LOGGER.error(f"Error loading forecast data for basin {basin}: {e}")
-        return _create_empty_forecast_dataframe()
-
-
-def compute_forecast_quartiles_as_variables(forecast_ds: xr.Dataset, 
-                                          quartiles: list = [0.25, 0.5, 0.75]) -> xr.Dataset:
-    """Compute quartiles from ensemble forecast data as separate variables.
-    
-    Parameters
-    ----------
-    forecast_ds : xr.Dataset
-        Dataset with ensemble forecasts containing 'ensemble_member' dimension
-    quartiles : list, optional
-        List of quantiles to compute (default: [0.25, 0.5, 0.75])
-        
-    Returns
-    -------
-    xr.Dataset
-        Dataset with quartile variables (e.g., temperature_2m_q25, temperature_2m_q50, etc.)
-    """
-    quartile_suffixes = {0.25: '_q25', 0.5: '_q50', 0.75: '_q75'}
-    new_data_vars = {}
-    
-    for var_name in forecast_ds.data_vars:
-        if 'ensemble_member' not in forecast_ds[var_name].dims:
-            # Variable doesn't have ensemble dimension, keep as is
-            new_data_vars[var_name] = forecast_ds[var_name]
-            continue
-            
-        var_data = forecast_ds[var_name]
-        var_quartiles = var_data.quantile(quartiles, dim='ensemble_member')
-        
-        for i, q in enumerate(quartiles):
-            suffix = quartile_suffixes.get(q, f'_q{int(q*100)}')
-            new_var_name = f"{var_name}{suffix}"
-            quartile_data = var_quartiles.isel(quantile=i).drop('quantile')
-            new_data_vars[new_var_name] = quartile_data
-    
-    # Keep coordinates that don't have ensemble_member dimension
-    coords_to_keep = {k: v for k, v in forecast_ds.coords.items() 
-                     if 'ensemble_member' not in v.dims}
-    
-    return xr.Dataset(new_data_vars, coords=coords_to_keep, attrs=forecast_ds.attrs)
-
-
-def _convert_forecast_to_dataframe(forecast_ds: xr.Dataset, basin_name: str, columns: list) -> pd.DataFrame:
-    """Convert forecast xarray Dataset to pandas DataFrame with MultiIndex.
-    
-    Parameters
-    ----------
-    forecast_ds : xr.Dataset
-        Forecast dataset with time and lead_time dimensions
-    basin_name : str
-        Name of the basin
-    columns : list
-        List of variable columns to include
-        
-    Returns
-    -------
-    pd.DataFrame
-        MultiIndex DataFrame with (time, lead_time) index
-    """
-    # Select data for the specific basin
-    if 'basin' in forecast_ds.dims:
-        basin_data = forecast_ds.sel(basin=basin_name)
-    else:
-        basin_data = forecast_ds
-    
-    # Convert to DataFrame 
-    df = basin_data.to_dataframe()
-    
-    # Ensure we have the right index structure
-    if 'init_time' in df.index.names:
-        df = df.reset_index()
-        df = df.rename(columns={'init_time': 'time'})
-        df = df.set_index(['time', 'lead_time'])
-    elif df.index.names != ['time', 'lead_time']:
-        # Try to reconstruct proper MultiIndex
-        df = df.reset_index()
-        time_cols = [col for col in df.columns if 'time' in col.lower()]
-        lead_cols = [col for col in df.columns if 'lead' in col.lower()]
-        
-        if time_cols and lead_cols:
-            df = df.set_index([time_cols[0], lead_cols[0]])
-            df.index.names = ['time', 'lead_time']
-    
-    # Filter to requested columns
-    if columns:
-        available_vars = [var for var in columns if var in df.columns]
-        if available_vars:
-            df = df[available_vars]
-        else:
-            LOGGER.warning(f"No requested variables found in forecast data. Available: {list(df.columns)}")
-            return _create_empty_forecast_dataframe()
-    
-    return df
-
-
-def _create_empty_forecast_dataframe() -> pd.DataFrame:
-    """Create an empty DataFrame with proper MultiIndex structure for forecasts."""
-    multi_index = pd.MultiIndex.from_product(
-        [pd.DatetimeIndex([]), pd.Index([])], 
-        names=['time', 'lead_time']
-    )
-    return pd.DataFrame(index=multi_index)
-
 
 # Use the same validation function from the original ForecastDataset
 @njit()
