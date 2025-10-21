@@ -232,13 +232,30 @@ class OnlineForecastDataset(GenericDataset):
 
             xr_dataset = xr.concat(basin_datasets, dim='basin')
 
+            chunk_map = {}
+            if 'basin' in xr_dataset.dims:
+                chunk_map['basin'] = 1 # chunk by single basin
+            if 'time' in xr_dataset.dims:
+                chunk_map['time'] = xr_dataset.dims['time'] # chunk by full time dimension
+            if 'lead_time' in xr_dataset.dims:
+                chunk_map['lead_time'] = xr_dataset.dims['lead_time'] # chunk by full lead_time dimension
+            if chunk_map:
+                xr_dataset = xr_dataset.chunk(chunk_map)
+
             if self.is_train and self.cfg.save_train_data:
-                self._save_xarray_dataset(xr_dataset)
+                self._save_per_basin_zarr(xr_dataset)
 
         else:
-            with self.cfg.train_data_file.open("rb") as fp:
-                d = pickle.load(fp)
-            xr_dataset = xr.Dataset.from_dict(d)
+            # Check if loading from per-basin Zarr stores
+            zarr_dir = self.cfg.train_dir / "train_data_zarr"
+            if zarr_dir.exists() and (zarr_dir / "_manifest.txt").exists():
+                xr_dataset = self._load_per_basin_zarr(zarr_dir)
+            else:
+                # Fallback to pickle format
+                with self.cfg.train_data_file.open("rb") as fp:
+                    d = pickle.load(fp)
+                xr_dataset = xr.Dataset.from_dict(d)
+            
             if not self.frequencies:
                 native_frequency = utils.infer_frequency(xr_dataset["time"].values)
                 self.frequencies = [native_frequency]
@@ -424,7 +441,7 @@ class OnlineForecastDataset(GenericDataset):
                 quartile_data = var_quartiles.isel(quantile=i).drop('quantile')
                 
                 # Add to new data variables
-        new_data_vars[new_var_name] = quartile_data
+                new_data_vars[new_var_name] = quartile_data
         
         # Create new dataset with the same coordinates (excluding ensemble_member)
         coords_to_keep = {k: v for k, v in forecast_ds.coords.items() if 'ensemble_member' not in v.dims}
@@ -442,6 +459,122 @@ class OnlineForecastDataset(GenericDataset):
         
         return quartile_ds
         
+    def _save_per_basin_zarr(self, xr_dataset: xr.Dataset):
+        """Save each basin to a separate Zarr store for efficient per-basin access.
+        
+        Each basin is stored as a standalone Zarr directory under train_dir/train_data_zarr/
+        with optimized chunking and compression settings. This approach enables:
+        - Parallel basin writes and reads
+        - Incremental basin updates without rewriting the entire dataset
+        - Efficient partial loading during evaluation
+        
+        Parameters
+        ----------
+        xr_dataset : xr.Dataset
+            Multi-basin xarray Dataset with dimensions (basin, time) and (basin, time, lead_time)
+        """
+        # Use Zarr 3.x compatible compression codec
+        try:
+            import zarr
+            zarr_version = int(zarr.__version__.split('.')[0])
+            
+            if zarr_version >= 3:
+                # Zarr 3.x: use the new codec API
+                from zarr.codecs import BloscCodec
+                compressor = BloscCodec(cname='zstd', clevel=5, shuffle='shuffle')
+            else:
+                # Zarr 2.x: use numcodecs
+                from numcodecs import Blosc
+                compressor = Blosc(cname='zstd', clevel=5, shuffle=Blosc.SHUFFLE)
+        except ImportError:
+            LOGGER.warning("Compression codec not available; using default compression")
+            compressor = None
+        
+        zarr_root = self.cfg.train_dir / "train_data_zarr"
+        zarr_root.mkdir(parents=True, exist_ok=True)
+        
+        basin_list = xr_dataset['basin'].values.tolist()
+        
+        if not self._disable_pbar:
+            LOGGER.info(f"Saving {len(basin_list)} basins to individual Zarr stores in {zarr_root}")
+        
+        for basin in tqdm(basin_list, file=sys.stdout, disable=self._disable_pbar, desc="Saving basins"):
+            basin_ds = xr_dataset.sel(basin=basin, drop=True)
+            basin_path = zarr_root / f"{basin}.zarr"
+            
+            # Build encoding dict per variable to control chunking and compression
+            encoding = {}
+            for var_name in basin_ds.data_vars:
+                var_dims = basin_ds[var_name].dims
+                chunks_dict = {}
+                
+                if 'time' in var_dims:
+                    chunks_dict['time'] = basin_ds.dims['time']
+                if 'lead_time' in var_dims:
+                    chunks_dict['lead_time'] = basin_ds.dims['lead_time']
+                
+                encoding[var_name] = {
+                    'chunks': tuple(chunks_dict.get(d, basin_ds.dims[d]) for d in var_dims),
+                    'compressor': compressor
+                }
+            
+            # Write to Zarr with consolidated metadata for fast opening
+            basin_ds.to_zarr(
+                basin_path,
+                mode='w',
+                encoding=encoding,
+                consolidated=True,
+                compute=True
+            )
+        
+        # Write a manifest file listing all basins for easy reloading
+        manifest_path = zarr_root / "_manifest.txt"
+        with manifest_path.open('w') as f:
+            for basin in basin_list:
+                f.write(f"{basin}\n")
+        
+        LOGGER.info(f"✅ Saved {len(basin_list)} basins to Zarr stores in {zarr_root}")
+
+    def _load_per_basin_zarr(self, zarr_dir) -> xr.Dataset:
+        """Load basin datasets from individual Zarr stores and merge them.
+        
+        Parameters
+        ----------
+        zarr_dir : Path
+            Directory containing per-basin Zarr stores
+            
+        Returns
+        -------
+        xr.Dataset
+            Merged multi-basin dataset
+        """
+        manifest_path = zarr_dir / "_manifest.txt"
+        with manifest_path.open('r') as f:
+            basin_list = [line.strip() for line in f if line.strip()]
+        
+        if not self._disable_pbar:
+            LOGGER.info(f"Loading {len(basin_list)} basins from individual Zarr stores in {zarr_dir}")
+        
+        basin_datasets = []
+        for basin in tqdm(basin_list, file=sys.stdout, disable=self._disable_pbar, desc="Loading basins"):
+            basin_path = zarr_dir / f"{basin}.zarr"
+            if basin_path.exists():
+                basin_ds = xr.open_zarr(basin_path, consolidated=True)
+                # Add basin coordinate back
+                basin_ds = basin_ds.expand_dims(basin=[basin])
+                basin_datasets.append(basin_ds)
+            else:
+                LOGGER.warning(f"Zarr store not found for basin {basin} at {basin_path}")
+        
+        if not basin_datasets:
+            raise FileNotFoundError(f"No valid Zarr stores found in {zarr_dir}")
+        
+        # Concatenate all basins along basin dimension
+        merged_ds = xr.concat(basin_datasets, dim='basin')
+        LOGGER.info(f"✅ Loaded {len(basin_datasets)} basins from Zarr stores")
+        
+        return merged_ds
+
     def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
         basin, indices = self.lookup_table[item]
 
