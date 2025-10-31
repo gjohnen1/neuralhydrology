@@ -254,8 +254,6 @@ class OnlineForecastDataset(GenericDataset):
         if not self.frequencies:
             native_frequency = utils.infer_frequency(dataset["time"].values)
             self.frequencies = [native_frequency]
-        if getattr(self.cfg, "plot_cached_dataset_preview", False):
-            self._plot_cached_dataset(dataset)
         return dataset
 
         return None
@@ -283,80 +281,6 @@ class OnlineForecastDataset(GenericDataset):
 
         train_dir_path = Path(train_dir)
         return [train_dir_path / 'train_data.zarr']
-
-    def _plot_cached_dataset(self, dataset: xr.Dataset) -> None:
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError:
-            LOGGER.warning("Matplotlib not available; cannot render cached dataset preview.")
-            return
-
-        if not self.basins:
-            LOGGER.warning("No basins available; skipping cached dataset preview plot.")
-            return
-
-        basin = self.basins[0]
-
-        hindcast_var = next((name for name, da in dataset.data_vars.items() if 'lead_time' not in da.dims), None)
-        forecast_var = next((name for name, da in dataset.data_vars.items() if 'lead_time' in da.dims), None)
-
-        if hindcast_var is None or forecast_var is None:
-            LOGGER.warning("Could not find suitable variables for cached dataset preview plot.")
-            return
-
-        try:
-            hind_da = dataset[hindcast_var].sel(basin=basin).load()
-            forecast_da = dataset[forecast_var].sel(basin=basin).load()
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Failed to extract data for cached dataset preview plot: %s", exc)
-            return
-
-        if 'time' not in hind_da.dims:
-            LOGGER.warning("Hindcast variable %s does not have a time dimension; skipping preview plot.", hindcast_var)
-            return
-
-        time_index = pd.to_datetime(hind_da['time'].values)
-        if time_index.size == 0:
-            LOGGER.warning("Cached dataset preview: empty time coordinate.")
-            return
-
-        # Use most recent week of historical data for readability
-        hist_window = min(time_index.size, 7 * 24)
-        hind_series = hind_da.isel(time=slice(-hist_window, None)).to_pandas()
-
-        latest_time = time_index[-1]
-        try:
-            forecast_slice = forecast_da.sel(time=latest_time)
-        except Exception:
-            forecast_slice = forecast_da.isel(time=-1)
-        forecast_slice = forecast_slice.load()
-
-        if 'lead_time' not in forecast_slice.dims:
-            LOGGER.warning("Forecast variable %s is missing lead_time dimension; skipping preview plot.", forecast_var)
-            return
-
-        lead_times = pd.to_timedelta(forecast_slice['lead_time'].values)
-        forecast_dates = pd.to_datetime(latest_time) + lead_times
-        forecast_values = forecast_slice.values
-
-        fig, (ax_hist, ax_fc) = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
-
-        ax_hist.plot(hind_series.index, hind_series.values, color='black', lw=1.5, label=f"{hindcast_var} (historical)")
-        ax_hist.axvline(pd.to_datetime(latest_time), color='royalblue', lw=1, label='Forecast init')
-        ax_hist.set_ylabel(hindcast_var)
-        ax_hist.legend()
-        ax_hist.grid(alpha=0.2)
-
-        ax_fc.plot(forecast_dates, forecast_values, color='crimson', lw=1.5, label=f"{forecast_var}")
-        ax_fc.set_ylabel(forecast_var)
-        ax_fc.set_xlabel('Date')
-        ax_fc.legend()
-        ax_fc.grid(alpha=0.2)
-
-        fig.suptitle(f"Cached dataset preview – basin {basin}")
-        fig.autofmt_xdate(rotation=15)
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-        plt.show()
 
     def _load_pickled_dataset(self, train_data_file: Path) -> xr.Dataset:
         with train_data_file.open("rb") as fp:
