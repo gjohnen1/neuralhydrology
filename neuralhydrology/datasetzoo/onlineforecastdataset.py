@@ -1,28 +1,24 @@
-# import re
-# from collections import defaultdict
-from typing import List, Dict, Union, Tuple
-# from pandas.tseries import frequencies
-from pandas.tseries.frequencies import to_offset
-from numba import NumbaPendingDeprecationWarning
-from numba import njit, prange
-# from ruamel.yaml import YAML
-# from torch.utils.data import Dataset
-from tqdm import tqdm
-import pandas as pd
-import numpy as np
-import xarray as xr
-import torch
+from pathlib import Path
 import logging
-import warnings
-import sys
 import pickle
+import shutil
+import sys
+import time
+import warnings
+from typing import Dict, List, Tuple, Union, Optional
 
-# from neuralhydrology.datasetzoo.basedataset import BaseDataset
+import numpy as np
+import pandas as pd
+import torch
+import xarray as xr
+from numba import NumbaPendingDeprecationWarning, njit, prange
+from pandas.tseries.frequencies import to_offset
+from tqdm import tqdm
+
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
 from neuralhydrology.datautils import utils
 from neuralhydrology.utils.config import Config
-from neuralhydrology.utils.errors import NoTrainDataError, NoEvaluationDataError
-# from neuralhydrology.utils import samplingutils
+from neuralhydrology.utils.errors import NoEvaluationDataError, NoTrainDataError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -116,134 +112,293 @@ class OnlineForecastDataset(GenericDataset):
             self._predict_last_n = [self._predict_last_n]
 
     def _load_or_create_xarray_dataset(self) -> xr.Dataset:
-        # if no netCDF file is passed, data set is created from raw basin files and online sources
-        if (self.cfg.train_data_file is None) or (not self.is_train):
+        train_data_file: Optional[Path] = getattr(self.cfg, 'train_data_file', None)
 
-            if not self._disable_pbar:
-                LOGGER.info("Loading basin data into xarray data set using direct xarray approach.")
+        cached_dataset = self._load_cached_dataset(train_data_file)
+        if cached_dataset is not None:
+                return cached_dataset
 
-            forecast_ds = self._load_forecast_xarray_data()
-            historical_ds = self._load_historical_xarray_data()
-
-            if forecast_ds is None or historical_ds is None:
-                if self.is_train:
-                    raise NoTrainDataError
-                raise NoEvaluationDataError
-
-            if 'init_time' in forecast_ds.dims:
-                forecast_ds = forecast_ds.rename({'init_time': 'time'})
-
-            # ensure time dimension is available on both datasets
-            if 'time' not in forecast_ds.dims or 'time' not in historical_ds.dims:
-                raise ValueError('Both forecast and historical datasets must provide a time dimension.')
-
-            if not self.frequencies:
-                inferred_freq = utils.infer_frequency(historical_ds['time'].values)
-                if inferred_freq is None:
-                    raise ValueError('Could not infer native frequency from historical dataset.')
-                self.frequencies = [inferred_freq]
-
-            offsets = [(self.seq_len[i] - max(self._predict_last_n[i], self._forecast_seq_len[i])) * to_offset(freq)
-                       for i, freq in enumerate(self.frequencies)]
-
-            basin_datasets = []
-            basins_without_data: List[str] = []
-
-            for basin in self.basins:
-                if 'basin' not in historical_ds.coords or basin not in historical_ds['basin'].values:
-                    LOGGER.warning(f"Historical data not available for basin {basin} - skipping.")
-                    basins_without_data.append(basin)
-                    continue
-                if 'basin' not in forecast_ds.coords or basin not in forecast_ds['basin'].values:
-                    LOGGER.warning(f"Forecast data not available for basin {basin} - skipping.")
-                    basins_without_data.append(basin)
-                    continue
-                if basin not in self.start_and_end_dates:
-                    LOGGER.warning(f"No temporal configuration found for basin {basin} - skipping.")
-                    basins_without_data.append(basin)
-                    continue
-
-                hist_basin = historical_ds.sel(basin=basin, drop=False)
-                fcst_basin = forecast_ds.sel(basin=basin, drop=False)
-
-                native_frequency = utils.infer_frequency(hist_basin['time'].values)
-                if native_frequency is None:
-                    native_frequency = self.frequencies[0]
-
-                start_dates = self.start_and_end_dates[basin]["start_dates"]
-                end_dates = [date + pd.Timedelta(days=1, seconds=-1)
-                             for date in self.start_and_end_dates[basin]["end_dates"]]
-
-                hist_slices = []
-                fcst_slices = []
-
-                for start_date, end_date in zip(start_dates, end_dates):
-                    warmup_start = min(start_date - offset for offset in offsets)
-
-                    full_hist_index = pd.date_range(start=warmup_start,
-                                                    end=end_date,
-                                                    freq=native_frequency)
-                    period_index = pd.date_range(start=start_date,
-                                                 end=end_date,
-                                                 freq=native_frequency)
-
-                    hist_slice = hist_basin.sel(time=slice(warmup_start, end_date))
-                    hist_slice = hist_slice.reindex({'time': full_hist_index})
-
-                    fcst_slice = fcst_basin.sel(time=slice(start_date, end_date))
-                    fcst_slice = fcst_slice.reindex({'time': period_index})
-
-                    warmup_mask = hist_slice['time'] < np.datetime64(start_date)
-                    for target_var in self.cfg.target_variables:
-                        if target_var in hist_slice.data_vars:
-                            hist_slice[target_var] = hist_slice[target_var].where(~warmup_mask, np.nan)
-
-                    hist_slices.append(hist_slice)
-                    fcst_slices.append(fcst_slice)
-
-                if not hist_slices or not fcst_slices:
-                    LOGGER.warning(f"No temporal slices created for basin {basin} - skipping.")
-                    basins_without_data.append(basin)
-                    continue
-
-                hist_combined = xr.concat(hist_slices, dim='time').sortby('time')
-                fcst_combined = xr.concat(fcst_slices, dim='time').sortby('time')
-
-                hist_index = pd.Index(hist_combined['time'].values)
-                if hist_index.duplicated().any():
-                    keep_mask = ~hist_index.duplicated(keep='last')
-                    hist_combined = hist_combined.isel(time=keep_mask)
-
-                fcst_index = pd.Index(fcst_combined['time'].values)
-                if fcst_index.duplicated().any():
-                    keep_mask = ~fcst_index.duplicated(keep='last')
-                    fcst_combined = fcst_combined.isel(time=keep_mask)
-
-                basin_dataset = xr.merge([hist_combined, fcst_combined], compat='override')
-                basin_datasets.append(basin_dataset)
-
-            if basins_without_data:
-                LOGGER.info(f"Skipped basins without complete data: {sorted(set(basins_without_data))}")
-
-            if not basin_datasets:
-                if self.is_train:
-                    raise NoTrainDataError
-                raise NoEvaluationDataError
-
-            xr_dataset = xr.concat(basin_datasets, dim='basin')
-
+        if train_data_file is None or not self.is_train:
+            dataset = self._build_dataset_from_sources()
             if self.is_train and self.cfg.save_train_data:
-                self._save_xarray_dataset(xr_dataset)
+                self._save_dataset_cache(dataset)
+            return dataset
 
-        else:
-            with self.cfg.train_data_file.open("rb") as fp:
-                d = pickle.load(fp)
-            xr_dataset = xr.Dataset.from_dict(d)
-            if not self.frequencies:
-                native_frequency = utils.infer_frequency(xr_dataset["time"].values)
-                self.frequencies = [native_frequency]
+        dataset = self._load_pickled_dataset(Path(train_data_file))
+        if not self.frequencies:
+            native_frequency = utils.infer_frequency(dataset["time"].values)
+            self.frequencies = [native_frequency]
+        return dataset
 
-        return xr_dataset
+    def _build_dataset_from_sources(self) -> xr.Dataset:
+        if not self._disable_pbar:
+            LOGGER.info("Loading basin data into xarray data set using direct xarray approach.")
+
+        forecast_ds = self._load_forecast_xarray_data()
+        historical_ds = self._load_historical_xarray_data()
+
+        if forecast_ds is None or historical_ds is None:
+            if self.is_train:
+                raise NoTrainDataError
+            raise NoEvaluationDataError
+
+        if 'init_time' in forecast_ds.dims:
+            forecast_ds = forecast_ds.rename({'init_time': 'time'})
+
+        if 'time' not in forecast_ds.dims or 'time' not in historical_ds.dims:
+            raise ValueError('Both forecast and historical datasets must provide a time dimension.')
+
+        if not self.frequencies:
+            inferred_freq = utils.infer_frequency(historical_ds['time'].values)
+            if inferred_freq is None:
+                raise ValueError('Could not infer native frequency from historical dataset.')
+            self.frequencies = [inferred_freq]
+
+        offsets = [(self.seq_len[i] - max(self._predict_last_n[i], self._forecast_seq_len[i])) * to_offset(freq)
+                   for i, freq in enumerate(self.frequencies)]
+        retry_attempts, retry_delay = self._get_retry_config()
+
+        basin_datasets = []
+        basins_without_data: List[str] = []
+
+        for basin in self.basins:
+            if 'basin' not in historical_ds.coords or basin not in historical_ds['basin'].values:
+                LOGGER.warning("Historical data not available for basin %s - skipping.", basin)
+                basins_without_data.append(basin)
+                continue
+            if 'basin' not in forecast_ds.coords or basin not in forecast_ds['basin'].values:
+                LOGGER.warning("Forecast data not available for basin %s - skipping.", basin)
+                basins_without_data.append(basin)
+                continue
+            if basin not in self.start_and_end_dates:
+                LOGGER.warning("No temporal configuration found for basin %s - skipping.", basin)
+                basins_without_data.append(basin)
+                continue
+
+            hist_basin = historical_ds.sel(basin=basin, drop=False)
+            fcst_basin = forecast_ds.sel(basin=basin, drop=False)
+
+            native_frequency = utils.infer_frequency(hist_basin['time'].values) or self.frequencies[0]
+
+            start_dates = self.start_and_end_dates[basin]["start_dates"]
+            end_dates = [date + pd.Timedelta(days=1, seconds=-1)
+                         for date in self.start_and_end_dates[basin]["end_dates"]]
+
+            hist_slices = []
+            fcst_slices = []
+
+            for start_date, end_date in zip(start_dates, end_dates):
+                warmup_start = min(start_date - offset for offset in offsets)
+
+                full_hist_index = pd.date_range(start=warmup_start,
+                                                end=end_date,
+                                                freq=native_frequency)
+                period_index = pd.date_range(start=start_date,
+                                             end=end_date,
+                                             freq=native_frequency)
+
+                hist_slice = hist_basin.sel(time=slice(warmup_start, end_date)).reindex({'time': full_hist_index})
+                fcst_slice = self._materialize_forecast_slice(
+                    fcst_basin=fcst_basin,
+                    basin=basin,
+                    start_date=start_date,
+                    end_date=end_date,
+                    period_index=period_index,
+                    attempts=retry_attempts,
+                    delay=retry_delay,
+                )
+
+                warmup_mask = hist_slice['time'] < np.datetime64(start_date)
+                for target_var in self.cfg.target_variables:
+                    if target_var in hist_slice.data_vars:
+                        hist_slice[target_var] = hist_slice[target_var].where(~warmup_mask, np.nan)
+
+                hist_slices.append(hist_slice)
+                fcst_slices.append(fcst_slice)
+
+            if not hist_slices or not fcst_slices:
+                LOGGER.warning("No temporal slices created for basin %s - skipping.", basin)
+                basins_without_data.append(basin)
+                continue
+
+            hist_combined = xr.concat(hist_slices, dim='time').sortby('time')
+            fcst_combined = xr.concat(fcst_slices, dim='time').sortby('time')
+
+            hist_index = pd.Index(hist_combined['time'].values)
+            if hist_index.duplicated().any():
+                hist_combined = hist_combined.isel(time=~hist_index.duplicated(keep='last'))
+
+            fcst_index = pd.Index(fcst_combined['time'].values)
+            if fcst_index.duplicated().any():
+                fcst_combined = fcst_combined.isel(time=~fcst_index.duplicated(keep='last'))
+
+            basin_datasets.append(xr.merge([hist_combined, fcst_combined], compat='override'))
+
+        if basins_without_data:
+            LOGGER.info("Skipped basins without complete data: %s", sorted(set(basins_without_data)))
+
+        if not basin_datasets:
+            if self.is_train:
+                raise NoTrainDataError
+            raise NoEvaluationDataError
+
+        return xr.concat(basin_datasets, dim='basin')
+
+    def _load_cached_dataset(self, train_data_file: Optional[Path]) -> Optional[xr.Dataset]:
+        for cache_path in self._cache_candidates(train_data_file):
+            if not cache_path.exists() or not (cache_path.is_dir() or cache_path.suffix == '.zarr'):
+                continue
+
+            LOGGER.info("Loading cached dataset from %s", cache_path)
+        dataset = xr.open_zarr(store=cache_path)
+        if not self.frequencies:
+            native_frequency = utils.infer_frequency(dataset["time"].values)
+            self.frequencies = [native_frequency]
+        if getattr(self.cfg, "plot_cached_dataset_preview", False):
+            self._plot_cached_dataset(dataset)
+        return dataset
+
+        return None
+
+    def _determine_cache_path(self) -> Path:
+        candidates = self._cache_candidates(getattr(self.cfg, 'train_data_file', None))
+        return next((path for path in candidates if path is not None), self.cfg.train_dir / 'train_data.zarr')
+
+    def _save_dataset_cache(self, dataset: xr.Dataset) -> None:
+        cache_path = self._determine_cache_path()
+        if cache_path.exists():
+            LOGGER.info("Removing existing cache at %s", cache_path)
+            if cache_path.is_dir():
+                shutil.rmtree(cache_path)
+            else:
+                cache_path.unlink()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        LOGGER.info("Saving materialized dataset to %s", cache_path)
+        dataset.chunk({'basin': max(1, len(self.basins))}).to_zarr(store=cache_path, mode='w')
+
+    def _cache_candidates(self, train_data_file: Optional[Path]) -> List[Path]:
+        train_dir = getattr(self.cfg, 'train_dir', None)
+        if train_dir is None:
+            return []
+
+        train_dir_path = Path(train_dir)
+        return [train_dir_path / 'train_data.zarr']
+
+    def _plot_cached_dataset(self, dataset: xr.Dataset) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            LOGGER.warning("Matplotlib not available; cannot render cached dataset preview.")
+            return
+
+        if not self.basins:
+            LOGGER.warning("No basins available; skipping cached dataset preview plot.")
+            return
+
+        basin = self.basins[0]
+
+        hindcast_var = next((name for name, da in dataset.data_vars.items() if 'lead_time' not in da.dims), None)
+        forecast_var = next((name for name, da in dataset.data_vars.items() if 'lead_time' in da.dims), None)
+
+        if hindcast_var is None or forecast_var is None:
+            LOGGER.warning("Could not find suitable variables for cached dataset preview plot.")
+            return
+
+        try:
+            hind_da = dataset[hindcast_var].sel(basin=basin).load()
+            forecast_da = dataset[forecast_var].sel(basin=basin).load()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to extract data for cached dataset preview plot: %s", exc)
+            return
+
+        if 'time' not in hind_da.dims:
+            LOGGER.warning("Hindcast variable %s does not have a time dimension; skipping preview plot.", hindcast_var)
+            return
+
+        time_index = pd.to_datetime(hind_da['time'].values)
+        if time_index.size == 0:
+            LOGGER.warning("Cached dataset preview: empty time coordinate.")
+            return
+
+        # Use most recent week of historical data for readability
+        hist_window = min(time_index.size, 7 * 24)
+        hind_series = hind_da.isel(time=slice(-hist_window, None)).to_pandas()
+
+        latest_time = time_index[-1]
+        try:
+            forecast_slice = forecast_da.sel(time=latest_time)
+        except Exception:
+            forecast_slice = forecast_da.isel(time=-1)
+        forecast_slice = forecast_slice.load()
+
+        if 'lead_time' not in forecast_slice.dims:
+            LOGGER.warning("Forecast variable %s is missing lead_time dimension; skipping preview plot.", forecast_var)
+            return
+
+        lead_times = pd.to_timedelta(forecast_slice['lead_time'].values)
+        forecast_dates = pd.to_datetime(latest_time) + lead_times
+        forecast_values = forecast_slice.values
+
+        fig, (ax_hist, ax_fc) = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
+
+        ax_hist.plot(hind_series.index, hind_series.values, color='black', lw=1.5, label=f"{hindcast_var} (historical)")
+        ax_hist.axvline(pd.to_datetime(latest_time), color='royalblue', lw=1, label='Forecast init')
+        ax_hist.set_ylabel(hindcast_var)
+        ax_hist.legend()
+        ax_hist.grid(alpha=0.2)
+
+        ax_fc.plot(forecast_dates, forecast_values, color='crimson', lw=1.5, label=f"{forecast_var}")
+        ax_fc.set_ylabel(forecast_var)
+        ax_fc.set_xlabel('Date')
+        ax_fc.legend()
+        ax_fc.grid(alpha=0.2)
+
+        fig.suptitle(f"Cached dataset preview – basin {basin}")
+        fig.autofmt_xdate(rotation=15)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+    def _load_pickled_dataset(self, train_data_file: Path) -> xr.Dataset:
+        with train_data_file.open("rb") as fp:
+            dataset_dict = pickle.load(fp)
+        return xr.Dataset.from_dict(dataset_dict)
+
+    def _get_retry_config(self) -> Tuple[int, float]:
+        attempts = getattr(self.cfg, 'forecast_load_retries', 3) or 1
+        delay = getattr(self.cfg, 'forecast_load_retry_delay', 5) or 0
+        return max(1, int(attempts)), max(0.0, float(delay))
+
+    def _materialize_forecast_slice(self,
+                                    fcst_basin: xr.Dataset,
+                                    basin: str,
+                                    start_date: pd.Timestamp,
+                                    end_date: pd.Timestamp,
+                                    period_index: pd.DatetimeIndex,
+                                    attempts: int,
+                                    delay: float) -> xr.Dataset:
+        last_exception: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                fcst_slice = fcst_basin.sel(time=slice(start_date, end_date))
+                fcst_slice = fcst_slice.reindex({'time': period_index})
+                return fcst_slice.load()
+            except Exception as exc:  # noqa: BLE001 - log and retry specific fetch errors
+                last_exception = exc
+                LOGGER.warning(
+                    "Attempt %s/%s failed to materialize forecast data for basin %s between %s and %s: %s",
+                    attempt,
+                    attempts,
+                    basin,
+                    start_date,
+                    end_date,
+                    exc,
+                )
+                if attempt < attempts and delay > 0:
+                    time.sleep(delay)
+
+        if last_exception is not None:
+            raise last_exception
+        raise RuntimeError("Forecast materialization failed without raising an exception.")
 
     def _load_forecast_xarray_data(self) -> xr.Dataset:
         """Load forecast data directly as xarray dataset following operational notebook approach."""
@@ -310,10 +465,6 @@ class OnlineForecastDataset(GenericDataset):
                                f"Available after quartile computation: {list(basin_forecasts_hourly.data_vars)}")
             
             basin_forecasts_hourly = basin_forecasts_hourly[forecast_vars]
-            
-            # Materialize all Dask arrays into memory to avoid lazy evaluation overhead
-            LOGGER.info("Computing forecast data (materializing Dask arrays into memory)...")
-            basin_forecasts_hourly = basin_forecasts_hourly.compute()
             
             LOGGER.info(f"Loaded forecast data with variables: {list(basin_forecasts_hourly.data_vars)}")
             return basin_forecasts_hourly
