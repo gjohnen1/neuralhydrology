@@ -238,7 +238,7 @@ train_dir: ./operational_harz/runs
 time_series_data_sub_dir: timeseries
 
 # Set to True, if train data file should be save to disk. If empty or False, train data is not saved.
-save_train_data: False # Dataset of size 4GB takes long to save atm.
+save_train_data: True # Dataset of size 4GB takes long to save atm.
 
 # If existing train data file exist, specify path to the pickle file here
 train_data_file:
