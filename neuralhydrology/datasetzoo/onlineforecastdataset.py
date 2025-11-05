@@ -583,7 +583,7 @@ class OnlineForecastDataset(GenericDataset):
         return sample
     
     def _create_lookup_table(self, xr_dataset: xr.Dataset):
-        lookup = []
+        lookup: List[Tuple[str, List[Dict[str, Union[int, np.datetime64]]]]] = []
         if not self._disable_pbar:
             LOGGER.info("Create lookup table and convert to pytorch tensor")
 
@@ -598,158 +598,174 @@ class OnlineForecastDataset(GenericDataset):
             raise ValueError('Dataset does not contain any hindcast or target variables after removing cfg.forecast_inputs.')
 
         xr_hcst = xr_dataset[hindcast_vars]
-
         if 'lead_time' in xr_hcst.dims:
             xr_hcst = xr_hcst.drop_dims('lead_time')
 
         time_dim = 'time' if 'time' in xr_hcst.dims else 'date'
+        issue_dim = 'issue_time' if 'issue_time' in xr_fcst.dims else ('time' if 'time' in xr_fcst.dims else 'date')
 
-        basins_without_samples = []
+        basins_without_samples: List[str] = []
         basin_coordinates = xr_hcst['basin'].values.tolist()
 
         for basin in tqdm(basin_coordinates, file=sys.stdout, disable=self._disable_pbar):
-            x_h, x_f, y, dates = {}, {}, {}, {}
-            hindcast_maps: Dict[str, np.ndarray] = {}
-            forecast_maps: Dict[str, np.ndarray] = {}
-            validity_masks: List[np.ndarray] = []
-
             basin_hcst = xr_hcst.sel(basin=basin, drop=True)
             basin_fcst = xr_fcst.sel(basin=basin, drop=True)
 
             if time_dim not in basin_hcst.dims:
-                LOGGER.warning(f"Time dimension not found for basin {basin} - skipping.")
+                LOGGER.warning("Time dimension not found for basin %s - skipping.", basin)
                 basins_without_samples.append(basin)
                 continue
 
-            issue_dim = 'issue_time' if 'issue_time' in basin_fcst.dims else ('time' if 'time' in basin_fcst.dims else 'date')
-            issue_times = pd.DatetimeIndex(basin_fcst[issue_dim].values)
+            if issue_dim not in basin_fcst.dims:
+                LOGGER.warning("Issue-time dimension not found for basin %s - skipping.", basin)
+                basins_without_samples.append(basin)
+                continue
+
+            hindcast_df = basin_hcst.to_dataframe().reset_index().set_index(time_dim).sort_index()
+            if hindcast_df.empty:
+                LOGGER.warning("Hindcast data empty for basin %s - skipping.", basin)
+                basins_without_samples.append(basin)
+                continue
+
+            forecast_df = basin_fcst.to_dataframe().reset_index().set_index([issue_dim, 'lead_time']).sort_index()
+            if forecast_df.empty:
+                LOGGER.warning("Forecast data empty for basin %s - skipping.", basin)
+                basins_without_samples.append(basin)
+                continue
+
+            issue_times = forecast_df.index.get_level_values(issue_dim).unique()
             if issue_times.empty:
-                LOGGER.warning(f"No forecast issue times available for basin {basin} - skipping.")
+                LOGGER.warning("No forecast issue times available for basin %s - skipping.", basin)
                 basins_without_samples.append(basin)
                 continue
 
+            available_hindcast = [col for col in self.cfg.hindcast_inputs if col in hindcast_df.columns]
+            if not available_hindcast:
+                raise ValueError(f'No hindcast inputs available for basin {basin}. Check cfg.hindcast_inputs.')
+
+            available_targets = [col for col in self.cfg.target_variables if col in hindcast_df.columns]
+            if not available_targets:
+                raise ValueError(f'No target variables available for basin {basin}. Check cfg.target_variables.')
+
+            available_forecast = [col for col in self.cfg.forecast_inputs if col in forecast_df.columns]
+            if not available_forecast:
+                raise ValueError(f'No forecast inputs available for basin {basin}. Check cfg.forecast_inputs.')
+
+            hindcast_matrix = hindcast_df[available_hindcast].to_numpy(dtype=np.float32)
+            target_matrix = hindcast_df[available_targets].to_numpy(dtype=np.float32)
+            date_values = hindcast_df.index.to_numpy()
+
+            fc_inputs = basin_fcst[available_forecast]
+            # NOAA GEFS precipitation rates are averaged since the previous step, so the first
+            # lead-time in each issue can be NaN after interpolation; fill forward to retain samples.
+            if 'lead_time' in fc_inputs.dims:
+                fc_inputs = fc_inputs.bfill(dim='lead_time')
+            fc_tensor_da = fc_inputs.to_array('variable')
+            if 'lead_time' in fc_tensor_da.dims:
+                fc_tensor = fc_tensor_da.transpose(issue_dim, 'lead_time', 'variable').values.astype(np.float32)
+            else:
+                fc_tensor = fc_tensor_da.transpose(issue_dim, 'variable').values.astype(np.float32)[:, np.newaxis, :]
+
+            if fc_tensor.shape[1] < max(self._forecast_seq_len):
+                LOGGER.warning("Forecast tensor shorter than forecast_seq_length for basin %s - skipping.", basin)
+                basins_without_samples.append(basin)
+                continue
+
+            hindcast_index = pd.Index(hindcast_df.index)
+            issue_time_values = issue_times.to_numpy()
+            hindcast_positions = hindcast_index.get_indexer(issue_times)
+
+            self._x_h.setdefault(basin, {})
+            self._x_f.setdefault(basin, {})
+            self._y.setdefault(basin, {})
+            self._dates.setdefault(basin, {})
+            self._issue_times.setdefault(basin, {})
+
+            validity_masks: List[np.ndarray] = []
             for freq_idx, freq in enumerate(self.frequencies):
-                available_hindcast = [var for var in self.cfg.hindcast_inputs if var in basin_hcst.data_vars]
-                if not available_hindcast:
-                    raise ValueError(f'No hindcast inputs available for basin {basin}. Check cfg.hindcast_inputs.')
-
-                hc_inputs = basin_hcst[available_hindcast]
-                x_h_array = hc_inputs.to_array('variable').transpose(time_dim, 'variable').values
-                x_h[freq] = x_h_array
-
-                available_forecast = [var for var in self.cfg.forecast_inputs if var in basin_fcst.data_vars]
-                if not available_forecast:
-                    raise ValueError(f'No forecast inputs available for basin {basin}. Check cfg.forecast_inputs.')
-
-                fc_inputs = basin_fcst[available_forecast]
-                fc_array = fc_inputs.to_array('variable')
-                if 'lead_time' in fc_array.dims:
-                    fc_array = fc_array.transpose(issue_dim, 'lead_time', 'variable').values
-                else:
-                    # Keep forecast tensors three-dimensional even without lead_time information.
-                    fc_array = fc_array.transpose(issue_dim, 'variable').values[:, np.newaxis, :]
-                x_f[freq] = fc_array
-
-                available_targets = [var for var in self.cfg.target_variables if var in basin_hcst.data_vars]
-                if not available_targets:
-                    raise ValueError(f'No target variables available for basin {basin}. Check cfg.target_variables.')
-
-                target_da = basin_hcst[available_targets]
-                y_array = target_da.to_array('variable').transpose(time_dim, 'variable').values
-                y[freq] = y_array
-
-                dates[freq] = basin_hcst[time_dim].values
-
-                hindcast_index = pd.Index(basin_hcst[time_dim].values)
-                hindcast_positions = hindcast_index.get_indexer(issue_times, method=None)
-                hindcast_maps[freq] = hindcast_positions
-                forecast_maps[freq] = np.arange(len(issue_times), dtype=np.int64)
-
-                validity = np.zeros(len(issue_times), dtype=bool)
                 hindcast_history = self.seq_len[freq_idx] - self._forecast_seq_len[freq_idx]
                 if hindcast_history <= 0:
                     raise ValueError('seq_length must exceed forecast_seq_length to provide hindcast context.')
+
+                validity = np.zeros(len(issue_times), dtype=bool)
 
                 for candidate_idx, anchor_idx in enumerate(hindcast_positions):
                     if anchor_idx < 0:
                         continue
 
-                    hindcast_start_idx = anchor_idx + self._forecast_offset - hindcast_history
-                    hindcast_end_idx = anchor_idx + self._forecast_offset
-                    global_end_idx = anchor_idx + self._forecast_offset + self._forecast_seq_len[freq_idx]
+                    hindcast_start = anchor_idx + self._forecast_offset - hindcast_history
+                    hindcast_end = anchor_idx + self._forecast_offset
+                    forecast_end = anchor_idx + self._forecast_offset + self._forecast_seq_len[freq_idx]
 
-                    if hindcast_start_idx < 0:
+                    if hindcast_start < 0:
                         continue
-                    if hindcast_end_idx > x_h_array.shape[0]:
-                        continue
-                    if global_end_idx > y_array.shape[0]:
+                    if forecast_end > target_matrix.shape[0]:
                         continue
 
                     if self.is_train:
-                        hindcast_window = x_h_array[hindcast_start_idx:hindcast_end_idx]
+                        hindcast_window = hindcast_matrix[hindcast_start:hindcast_end]
                         if np.any(np.isnan(hindcast_window)):
                             continue
 
-                        forecast_window = fc_array[forecast_maps[freq][candidate_idx]]
+                        forecast_window = fc_tensor[candidate_idx, :self._forecast_seq_len[freq_idx]]
                         if np.any(np.isnan(forecast_window)):
                             continue
 
-                        target_window = y_array[hindcast_start_idx:global_end_idx]
+                        target_window = target_matrix[hindcast_start:forecast_end]
                         predict_last_n = self._predict_last_n[freq_idx]
                         if predict_last_n > 0:
-                            target_tail = target_window[-predict_last_n:]
-                            if target_tail.size > 0 and np.all(np.isnan(target_tail)):
+                            tail = target_window[-predict_last_n:]
+                            if tail.size > 0 and np.all(np.isnan(tail)):
                                 continue
 
                     validity[candidate_idx] = True
 
                 validity_masks.append(validity)
 
-            if not self.is_train:
-                self.period_starts[basin] = pd.to_datetime(basin_hcst[time_dim].values[0])
-
             if not validity_masks:
                 basins_without_samples.append(basin)
                 continue
 
             combined_validity = np.logical_and.reduce(validity_masks)
+            # The last forecast_seq_len issue times usually remain False because we cannot
+            # form a full target horizon once we move past the available observation window.
             valid_indices = np.where(combined_validity)[0]
 
-            if valid_indices.size > 0:
-                if not self.cfg.hindcast_inputs:
-                    raise ValueError('Hindcast inputs must be provided if forecast inputs are provided.')
-
-                self._x_h[basin] = {freq: torch.from_numpy(_x_h.astype(np.float32)) for freq, _x_h in x_h.items()}
-                self._x_f[basin] = {freq: torch.from_numpy(_x_f.astype(np.float32)) for freq, _x_f in x_f.items()}
-                self._y[basin] = {freq: torch.from_numpy(_y.astype(np.float32)) for freq, _y in y.items()}
-                self._dates[basin] = dates
-                self._issue_times.setdefault(basin, {})
-                for freq in self.frequencies:
-                    self._issue_times[basin][freq] = issue_times.values
-
-                for candidate_idx in valid_indices:
-                    freq_pointers = []
-                    for freq in self.frequencies:
-                        freq_pointers.append({
-                            'hindcast_idx': int(hindcast_maps[freq][candidate_idx]),
-                            'forecast_idx': int(forecast_maps[freq][candidate_idx]),
-                            'issue_time': issue_times.values[candidate_idx],
-                        })
-                    lookup.append((basin, freq_pointers))
-            else:
+            if valid_indices.size == 0:
                 basins_without_samples.append(basin)
+                continue
+
+            for freq in self.frequencies:
+                self._x_h[basin][freq] = torch.from_numpy(hindcast_matrix)
+                self._x_f[basin][freq] = torch.from_numpy(fc_tensor)
+                self._y[basin][freq] = torch.from_numpy(target_matrix)
+                self._dates[basin][freq] = date_values
+                self._issue_times[basin][freq] = issue_time_values
+
+            if not self.is_train:
+                self.period_starts[basin] = pd.to_datetime(date_values[0])
+
+            for idx in valid_indices:
+                pointers = []
+                for freq in self.frequencies:
+                    pointers.append({
+                        'hindcast_idx': int(hindcast_positions[idx]),
+                        'forecast_idx': int(idx),
+                        'issue_time': issue_time_values[idx],
+                    })
+                lookup.append((basin, pointers))
 
         if basins_without_samples:
-            LOGGER.info(f"These basins do not have a single valid sample in the {self.period} period: {basins_without_samples}")
-        
+            LOGGER.info("These basins do not have a single valid sample in the %s period: %s",
+                        self.period, basins_without_samples)
+
         self.lookup_table = {i: elem for i, elem in enumerate(lookup)}
         self.num_samples = len(self.lookup_table)
-        
+
         if self.num_samples == 0:
             if self.is_train:
                 raise NoTrainDataError
-            else:
-                raise NoEvaluationDataError
+            raise NoEvaluationDataError
 
     def _validate_data_availability(self, cfg: Config):
         """Validate that configured time periods are within available data ranges.
