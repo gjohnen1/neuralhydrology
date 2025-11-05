@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
-from numba import NumbaPendingDeprecationWarning, njit, prange
 from pandas.tseries.frequencies import to_offset
 from tqdm import tqdm
 
@@ -77,6 +76,7 @@ class OnlineForecastDataset(GenericDataset):
         # Initialize forecast-specific attributes that are filled in the data loading functions
         self._x_h = {}
         self._x_f = {}
+        self._issue_times = {}
     
         # Validate data availability before initializing
         self._validate_data_availability(cfg)
@@ -203,7 +203,6 @@ class OnlineForecastDataset(GenericDataset):
                     basin=basin,
                     start_date=start_date,
                     end_date=end_date,
-                    period_index=period_index,
                     attempts=retry_attempts,
                     delay=retry_delay,
                 )
@@ -222,15 +221,15 @@ class OnlineForecastDataset(GenericDataset):
                 continue
 
             hist_combined = xr.concat(hist_slices, dim='time').sortby('time')
-            fcst_combined = xr.concat(fcst_slices, dim='time').sortby('time')
+            fcst_combined = xr.concat(fcst_slices, dim='issue_time').sortby('issue_time')
 
             hist_index = pd.Index(hist_combined['time'].values)
             if hist_index.duplicated().any():
                 hist_combined = hist_combined.isel(time=~hist_index.duplicated(keep='last'))
 
-            fcst_index = pd.Index(fcst_combined['time'].values)
+            fcst_index = pd.Index(fcst_combined['issue_time'].values)
             if fcst_index.duplicated().any():
-                fcst_combined = fcst_combined.isel(time=~fcst_index.duplicated(keep='last'))
+                fcst_combined = fcst_combined.isel(issue_time=~fcst_index.duplicated(keep='last'))
 
             basin_datasets.append(xr.merge([hist_combined, fcst_combined], compat='override'))
 
@@ -246,15 +245,15 @@ class OnlineForecastDataset(GenericDataset):
 
     def _load_cached_dataset(self, train_data_file: Optional[Path]) -> Optional[xr.Dataset]:
         for cache_path in self._cache_candidates(train_data_file):
-            if not cache_path.exists() or not (cache_path.is_dir() or cache_path.suffix == '.zarr'):
+            if not cache_path.exists():
                 continue
 
             LOGGER.info("Loading cached dataset from %s", cache_path)
-        dataset = xr.open_zarr(store=cache_path)
-        if not self.frequencies:
-            native_frequency = utils.infer_frequency(dataset["time"].values)
-            self.frequencies = [native_frequency]
-        return dataset
+            dataset = xr.open_zarr(store=cache_path)
+            if not self.frequencies:
+                native_frequency = utils.infer_frequency(dataset["time"].values)
+                self.frequencies = [native_frequency]
+            return dataset
 
         return None
 
@@ -297,14 +296,13 @@ class OnlineForecastDataset(GenericDataset):
                                     basin: str,
                                     start_date: pd.Timestamp,
                                     end_date: pd.Timestamp,
-                                    period_index: pd.DatetimeIndex,
                                     attempts: int,
                                     delay: float) -> xr.Dataset:
         last_exception: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
             try:
                 fcst_slice = fcst_basin.sel(time=slice(start_date, end_date))
-                fcst_slice = fcst_slice.reindex({'time': period_index})
+                fcst_slice = fcst_slice.rename({'time': 'issue_time'})
                 return fcst_slice.load()
             except Exception as exc:  # noqa: BLE001 - log and retry specific fetch errors
                 last_exception = exc
@@ -544,27 +542,31 @@ class OnlineForecastDataset(GenericDataset):
         basin, indices = self.lookup_table[item]
 
         sample = {}
-        for freq, seq_len, forecast_seq_len, idx in zip(self.frequencies, self.seq_len, self._forecast_seq_len, indices):
+        for freq, seq_len, forecast_seq_len, pointer in zip(self.frequencies, self.seq_len, self._forecast_seq_len, indices):
             # if there's just one frequency, don't use suffixes.
             freq_suffix = '' if len(self.frequencies) == 1 else f'_{freq}'
-            
-            # Calculate indices for hindcast and forecast periods
-            hindcast_start_idx = idx + self._forecast_offset + forecast_seq_len - seq_len
-            hindcast_end_idx = idx + self._forecast_offset
-            forecast_start_idx = idx
-            global_end_idx = idx + self._forecast_offset + forecast_seq_len 
+            hindcast_idx = pointer['hindcast_idx']
+            forecast_idx = pointer['forecast_idx']
+            issue_time = pointer.get('issue_time')
+
+            hindcast_history = seq_len - forecast_seq_len
+            hindcast_start_idx = hindcast_idx + self._forecast_offset - hindcast_history
+            hindcast_end_idx = hindcast_idx + self._forecast_offset
+            global_end_idx = hindcast_idx + self._forecast_offset + forecast_seq_len
 
             sample[f'x_h{freq_suffix}'] = self._x_h[basin][freq][hindcast_start_idx:hindcast_end_idx]
-            sample[f'x_f{freq_suffix}'] = self._x_f[basin][freq][forecast_start_idx]
+            sample[f'x_f{freq_suffix}'] = self._x_f[basin][freq][forecast_idx]
             sample[f'y{freq_suffix}'] = self._y[basin][freq][hindcast_start_idx:global_end_idx]
             sample[f'date{freq_suffix}'] = self._dates[basin][freq][hindcast_start_idx:global_end_idx]
+            if issue_time is not None:
+                sample[f'issue_time{freq_suffix}'] = issue_time
 
             # Handle static inputs
             static_inputs = []
             if self._attributes:
                 static_inputs.append(self._attributes[basin])
             if self._x_s:
-                static_inputs.append(self._x_s[basin][freq][idx])
+                static_inputs.append(self._x_s[basin][freq][hindcast_idx])
             if static_inputs:
                 sample[f'x_s{freq_suffix}'] = torch.cat(static_inputs, dim=-1)
 
@@ -606,9 +608,10 @@ class OnlineForecastDataset(GenericDataset):
         basin_coordinates = xr_hcst['basin'].values.tolist()
 
         for basin in tqdm(basin_coordinates, file=sys.stdout, disable=self._disable_pbar):
-            x_h, x_f, x_s, y, dates = {}, {}, {}, {}, {}
-            frequency_maps = {}
-            lowest_freq = utils.sort_frequencies(self.frequencies)[0]
+            x_h, x_f, y, dates = {}, {}, {}, {}
+            hindcast_maps: Dict[str, np.ndarray] = {}
+            forecast_maps: Dict[str, np.ndarray] = {}
+            validity_masks: List[np.ndarray] = []
 
             basin_hcst = xr_hcst.sel(basin=basin, drop=True)
             basin_fcst = xr_fcst.sel(basin=basin, drop=True)
@@ -618,7 +621,14 @@ class OnlineForecastDataset(GenericDataset):
                 basins_without_samples.append(basin)
                 continue
 
-            for freq in self.frequencies:
+            issue_dim = 'issue_time' if 'issue_time' in basin_fcst.dims else ('time' if 'time' in basin_fcst.dims else 'date')
+            issue_times = pd.DatetimeIndex(basin_fcst[issue_dim].values)
+            if issue_times.empty:
+                LOGGER.warning(f"No forecast issue times available for basin {basin} - skipping.")
+                basins_without_samples.append(basin)
+                continue
+
+            for freq_idx, freq in enumerate(self.frequencies):
                 available_hindcast = [var for var in self.cfg.hindcast_inputs if var in basin_hcst.data_vars]
                 if not available_hindcast:
                     raise ValueError(f'No hindcast inputs available for basin {basin}. Check cfg.hindcast_inputs.')
@@ -634,10 +644,10 @@ class OnlineForecastDataset(GenericDataset):
                 fc_inputs = basin_fcst[available_forecast]
                 fc_array = fc_inputs.to_array('variable')
                 if 'lead_time' in fc_array.dims:
-                    fc_array = fc_array.transpose(time_dim, 'lead_time', 'variable').values
+                    fc_array = fc_array.transpose(issue_dim, 'lead_time', 'variable').values
                 else:
                     # Keep forecast tensors three-dimensional even without lead_time information.
-                    fc_array = fc_array.transpose(time_dim, 'variable').values[:, np.newaxis, :]
+                    fc_array = fc_array.transpose(issue_dim, 'variable').values[:, np.newaxis, :]
                 x_f[freq] = fc_array
 
                 available_targets = [var for var in self.cfg.target_variables if var in basin_hcst.data_vars]
@@ -650,45 +660,82 @@ class OnlineForecastDataset(GenericDataset):
 
                 dates[freq] = basin_hcst[time_dim].values
 
-                n_time = x_h[freq].shape[0]
-                frequency_factor = int(utils.get_frequency_factor(lowest_freq, freq))
-                if frequency_factor <= 0:
-                    raise ValueError(f'Invalid frequency factor {frequency_factor} derived from {freq} relative to {lowest_freq}.')
-                if n_time % frequency_factor != 0:
-                    raise ValueError(f'The length of the sequence at frequency {freq} is {n_time} '
-                                     f'(including warmup), which is not a multiple of {frequency_factor}.')
-                frequency_maps[freq] = np.arange(n_time // frequency_factor) * frequency_factor + (frequency_factor - 1)
+                hindcast_index = pd.Index(basin_hcst[time_dim].values)
+                hindcast_positions = hindcast_index.get_indexer(issue_times, method=None)
+                hindcast_maps[freq] = hindcast_positions
+                forecast_maps[freq] = np.arange(len(issue_times), dtype=np.int64)
+
+                validity = np.zeros(len(issue_times), dtype=bool)
+                hindcast_history = self.seq_len[freq_idx] - self._forecast_seq_len[freq_idx]
+                if hindcast_history <= 0:
+                    raise ValueError('seq_length must exceed forecast_seq_length to provide hindcast context.')
+
+                for candidate_idx, anchor_idx in enumerate(hindcast_positions):
+                    if anchor_idx < 0:
+                        continue
+
+                    hindcast_start_idx = anchor_idx + self._forecast_offset - hindcast_history
+                    hindcast_end_idx = anchor_idx + self._forecast_offset
+                    global_end_idx = anchor_idx + self._forecast_offset + self._forecast_seq_len[freq_idx]
+
+                    if hindcast_start_idx < 0:
+                        continue
+                    if hindcast_end_idx > x_h_array.shape[0]:
+                        continue
+                    if global_end_idx > y_array.shape[0]:
+                        continue
+
+                    if self.is_train:
+                        hindcast_window = x_h_array[hindcast_start_idx:hindcast_end_idx]
+                        if np.any(np.isnan(hindcast_window)):
+                            continue
+
+                        forecast_window = fc_array[forecast_maps[freq][candidate_idx]]
+                        if np.any(np.isnan(forecast_window)):
+                            continue
+
+                        target_window = y_array[hindcast_start_idx:global_end_idx]
+                        predict_last_n = self._predict_last_n[freq_idx]
+                        if predict_last_n > 0:
+                            target_tail = target_window[-predict_last_n:]
+                            if target_tail.size > 0 and np.all(np.isnan(target_tail)):
+                                continue
+
+                    validity[candidate_idx] = True
+
+                validity_masks.append(validity)
 
             if not self.is_train:
                 self.period_starts[basin] = pd.to_datetime(basin_hcst[time_dim].values[0])
 
-            # Validate samples
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', category=NumbaPendingDeprecationWarning)
+            if not validity_masks:
+                basins_without_samples.append(basin)
+                continue
 
-                flag = validate_samples(
-                    x_h=[x_h[freq] for freq in self.frequencies] if self.is_train else None,
-                    x_f=[x_f[freq] for freq in self.frequencies] if self.is_train else None,
-                    y=[y[freq] for freq in self.frequencies] if self.is_train else None,
-                    seq_length=self.seq_len,
-                    forecast_seq_length=self._forecast_seq_len,
-                    forecast_offset=self._forecast_offset,
-                    predict_last_n=self._predict_last_n,
-                    frequency_maps=[frequency_maps[freq] for freq in self.frequencies]
-                )
+            combined_validity = np.logical_and.reduce(validity_masks)
+            valid_indices = np.where(combined_validity)[0]
 
-            valid_samples = np.argwhere(flag == 1)
-            for f in valid_samples:
-                lookup.append((basin, [frequency_maps[freq][int(f)] for freq in self.frequencies]))
-
-            # Store data for basins with valid samples
-            if valid_samples.size > 0:
+            if valid_indices.size > 0:
                 if not self.cfg.hindcast_inputs:
                     raise ValueError('Hindcast inputs must be provided if forecast inputs are provided.')
+
                 self._x_h[basin] = {freq: torch.from_numpy(_x_h.astype(np.float32)) for freq, _x_h in x_h.items()}
                 self._x_f[basin] = {freq: torch.from_numpy(_x_f.astype(np.float32)) for freq, _x_f in x_f.items()}
                 self._y[basin] = {freq: torch.from_numpy(_y.astype(np.float32)) for freq, _y in y.items()}
                 self._dates[basin] = dates
+                self._issue_times.setdefault(basin, {})
+                for freq in self.frequencies:
+                    self._issue_times[basin][freq] = issue_times.values
+
+                for candidate_idx in valid_indices:
+                    freq_pointers = []
+                    for freq in self.frequencies:
+                        freq_pointers.append({
+                            'hindcast_idx': int(hindcast_maps[freq][candidate_idx]),
+                            'forecast_idx': int(forecast_maps[freq][candidate_idx]),
+                            'issue_time': issue_times.values[candidate_idx],
+                        })
+                    lookup.append((basin, freq_pointers))
             else:
                 basins_without_samples.append(basin)
 
@@ -888,80 +935,3 @@ class OnlineForecastDataset(GenericDataset):
             
             LOGGER.error(error_msg)
             raise ValueError(error_msg)
-
-# Use the same validation function from the original ForecastDataset
-@njit()
-def validate_samples(x_h: List[np.ndarray], 
-                     x_f: List[np.ndarray],
-                     y: List[np.ndarray], 
-                     seq_length: List[int],
-                     forecast_seq_length: List[int],
-                     forecast_offset: int,
-                     predict_last_n: List[int], 
-                     frequency_maps: List[np.ndarray]) -> np.ndarray:
-    """Checks for invalid samples due to NaN or insufficient sequence length.
-
-    Parameters
-    ----------
-    x_h : List[np.ndarray]
-        List of dynamic hindcast input data; one entry per frequency
-    x_f : List[np.ndarray]
-        List of dynamic forecast input data; one entry per frequency
-    y : List[np.ndarray]
-        List of target values; one entry per frequency
-    seq_length : List[int]
-        List of sequence lengths; one entry per frequency
-    forecast_seq_length : List[int]
-        List of forecast sequence lengths; one entry per frequency
-    forecast_offset : int
-        Number of timesteps between hindcast end and forecast start
-    predict_last_n: List[int]
-        List of predict_last_n; one entry per frequency
-    frequency_maps : List[np.ndarray]
-        List of arrays mapping lowest-frequency samples to their corresponding last sample in each frequency
-
-    Returns
-    -------
-    np.ndarray 
-        Array has a value of 1 for valid samples and a value of 0 for invalid samples.
-    """
-    n_samples = len(frequency_maps[0])
-    flag = np.ones(n_samples)
-    
-    for i in range(len(frequency_maps)):
-        for j in prange(n_samples):
-            hindcast_seq_length = seq_length[i] - forecast_seq_length[i] 
-            last_sample_of_freq = frequency_maps[i][j]
-            
-            # Check sufficient history
-            if last_sample_of_freq < hindcast_seq_length:
-                flag[j] = 0
-                continue
-
-            # Check sufficient future data
-            if (last_sample_of_freq + forecast_offset + forecast_seq_length[i]) > n_samples:
-                flag[j] = 0
-                continue 
-
-            # Check for NaN in hindcast inputs
-            if x_h is not None:
-                _x_h = x_h[i][last_sample_of_freq - hindcast_seq_length + 1:last_sample_of_freq + 1]
-                if np.any(np.isnan(_x_h)):
-                    flag[j] = 0
-                    continue
-
-            # Check for NaN in forecast inputs
-            if x_f is not None:
-                _x_f = x_f[i][last_sample_of_freq]
-                if np.any(np.isnan(_x_f)):
-                    flag[j] = 0
-                    continue
-
-            # Check for all-NaN targets
-            if y is not None:
-                _y = y[i][last_sample_of_freq - predict_last_n[i] + 1:last_sample_of_freq + 1]
-                if np.prod(np.array(_y.shape)) > 0 and np.all(np.isnan(_y)):
-                    flag[j] = 0
-                    continue
-
-    return flag
