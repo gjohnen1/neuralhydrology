@@ -249,7 +249,7 @@ class OnlineForecastDataset(GenericDataset):
                 continue
 
             LOGGER.info("Loading cached dataset from %s", cache_path)
-            dataset = xr.open_zarr(store=cache_path)
+            dataset = xr.open_zarr(store=cache_path, decode_timedelta=True)
             if not self.frequencies:
                 native_frequency = utils.infer_frequency(dataset["time"].values)
                 self.frequencies = [native_frequency]
