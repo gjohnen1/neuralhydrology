@@ -5,6 +5,7 @@ import shutil
 import sys
 import time
 import warnings
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union, Optional
 
 import numpy as np
@@ -12,6 +13,7 @@ import pandas as pd
 import torch
 import xarray as xr
 from pandas.tseries.frequencies import to_offset
+from ruamel.yaml import YAML
 from tqdm import tqdm
 
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
@@ -21,6 +23,69 @@ from neuralhydrology.utils.errors import NoEvaluationDataError, NoTrainDataError
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class DataAvailability:
+    historical_start: Optional[pd.Timestamp] = None
+    historical_end: Optional[pd.Timestamp] = None
+    forecast_start: Optional[pd.Timestamp] = None
+    forecast_end: Optional[pd.Timestamp] = None
+
+    def update_from_dataset(self, dataset: Optional[xr.Dataset], dim: str, kind: str) -> None:
+        if dataset is None or dim not in dataset.coords:
+            return
+        coord_values = dataset[dim].values
+        if coord_values.size == 0:
+            return
+        start = pd.to_datetime(coord_values[0])
+        end = pd.to_datetime(coord_values[-1])
+        if kind == 'historical':
+            if self.historical_start is None or start < self.historical_start:
+                self.historical_start = start
+            if self.historical_end is None or end > self.historical_end:
+                self.historical_end = end
+        elif kind == 'forecast':
+            if self.forecast_start is None or start < self.forecast_start:
+                self.forecast_start = start
+            if self.forecast_end is None or end > self.forecast_end:
+                self.forecast_end = end
+
+    def update_from_attrs(self, attrs: Dict[str, str]) -> None:
+        mapping = {
+            'cache_hist_start': 'historical_start',
+            'cache_hist_end': 'historical_end',
+            'historical_data_end': 'historical_end',
+            'cache_issue_start': 'forecast_start',
+            'cache_issue_end': 'forecast_end',
+            'forecast_data_start': 'forecast_start',
+        }
+        for attr_key, field in mapping.items():
+            value = attrs.get(attr_key)
+            if value is None:
+                continue
+            timestamp = pd.to_datetime(value)
+            current = getattr(self, field)
+            if field.endswith('start'):
+                if current is None or timestamp < current:
+                    setattr(self, field, timestamp)
+            else:
+                if current is None or timestamp > current:
+                    setattr(self, field, timestamp)
+
+    def to_attrs(self) -> Dict[str, str]:
+        attrs: Dict[str, str] = {}
+        if self.historical_start is not None:
+            attrs['cache_hist_start'] = str(self.historical_start)
+        if self.historical_end is not None:
+            attrs['cache_hist_end'] = str(self.historical_end)
+            attrs['historical_data_end'] = str(self.historical_end)
+        if self.forecast_start is not None:
+            attrs['cache_issue_start'] = str(self.forecast_start)
+            attrs['forecast_data_start'] = str(self.forecast_start)
+        if self.forecast_end is not None:
+            attrs['cache_issue_end'] = str(self.forecast_end)
+        return attrs
 
 
 class OnlineForecastDataset(GenericDataset):
@@ -64,6 +129,8 @@ class OnlineForecastDataset(GenericDataset):
         Feature scaling parameters.
     """
 
+    CACHE_VERSION = "full-span-v2"
+
     def __init__(self,
                  cfg: Config,
                  is_train: bool,
@@ -73,13 +140,12 @@ class OnlineForecastDataset(GenericDataset):
                  id_to_int: Dict[str, int] = {},
                  scaler: Dict[str, Union[pd.Series, xr.DataArray]] = {}):
     
-        # Initialize forecast-specific attributes that are filled in the data loading functions
-        self._x_h = {}
-        self._x_f = {}
-        self._issue_times = {}
-    
-        # Validate data availability before initializing
-        self._validate_data_availability(cfg)
+        self._x_h: Dict[str, Dict[str, torch.Tensor]] = {}
+        self._x_f: Dict[str, Dict[str, torch.Tensor]] = {}
+        self._issue_times: Dict[str, Dict[str, np.ndarray]] = {}
+        self._availability = DataAvailability()
+
+        scaler = self._ensure_scaler(period=period, scaler=scaler, cfg=cfg)
 
         super().__init__(cfg=cfg,
                          is_train=is_train,
@@ -116,18 +182,23 @@ class OnlineForecastDataset(GenericDataset):
 
         cached_dataset = self._load_cached_dataset(train_data_file)
         if cached_dataset is not None:
-                return cached_dataset
+            self._update_data_availability(merged_ds=cached_dataset)
+            self._validate_data_availability(self.cfg)
+            return cached_dataset
 
         if train_data_file is None or not self.is_train:
             dataset = self._build_dataset_from_sources()
             if self.is_train and self.cfg.save_train_data:
                 self._save_dataset_cache(dataset)
+            self._validate_data_availability(self.cfg)
             return dataset
 
         dataset = self._load_pickled_dataset(Path(train_data_file))
         if not self.frequencies:
             native_frequency = utils.infer_frequency(dataset["time"].values)
             self.frequencies = [native_frequency]
+        self._update_data_availability(merged_ds=dataset)
+        self._validate_data_availability(self.cfg)
         return dataset
 
     def _build_dataset_from_sources(self) -> xr.Dataset:
@@ -142,11 +213,31 @@ class OnlineForecastDataset(GenericDataset):
                 raise NoTrainDataError
             raise NoEvaluationDataError
 
-        if 'init_time' in forecast_ds.dims:
-            forecast_ds = forecast_ds.rename({'init_time': 'time'})
+        if 'init_time' in forecast_ds.dims and 'issue_time' not in forecast_ds.dims:
+            forecast_ds = forecast_ds.rename({'init_time': 'issue_time'})
+        if 'time' in forecast_ds.dims and 'issue_time' not in forecast_ds.dims:
+            forecast_ds = forecast_ds.rename({'time': 'issue_time'})
 
-        if 'time' not in forecast_ds.dims or 'time' not in historical_ds.dims:
-            raise ValueError('Both forecast and historical datasets must provide a time dimension.')
+        if 'issue_time' not in forecast_ds.dims:
+            raise ValueError('Forecast dataset must expose an issue_time dimension.')
+        if 'time' not in historical_ds.dims:
+            raise ValueError('Historical dataset must expose a time dimension.')
+
+        forecast_ds = forecast_ds.sortby('issue_time')
+        historical_ds = historical_ds.sortby('time')
+
+        issue_times = forecast_ds['issue_time'].values
+        if issue_times.size == 0:
+            raise ValueError('Forecast dataset does not contain any issue times.')
+        hist_times = historical_ds['time'].values
+        if hist_times.size == 0:
+            raise ValueError('Historical dataset does not contain any timestamps.')
+
+        self._update_data_availability(historical_ds=historical_ds, forecast_ds=forecast_ds)
+        availability = self._availability
+        forecast_start = availability.forecast_start
+        forecast_end = availability.forecast_end
+        historical_end = availability.historical_end
 
         if not self.frequencies:
             inferred_freq = utils.infer_frequency(historical_ds['time'].values)
@@ -154,12 +245,28 @@ class OnlineForecastDataset(GenericDataset):
                 raise ValueError('Could not infer native frequency from historical dataset.')
             self.frequencies = [inferred_freq]
 
-        offsets = [(self.seq_len[i] - max(self._predict_last_n[i], self._forecast_seq_len[i])) * to_offset(freq)
-                   for i, freq in enumerate(self.frequencies)]
-        retry_attempts, retry_delay = self._get_retry_config()
+        reference_ts = pd.Timestamp('2000-01-01')  # Arbitrary anchor to convert DateOffsets to timedeltas
+        warmup_offsets = []
+        for i, freq in enumerate(self.frequencies):
+            forecast_horizon = max(self._predict_last_n[i], self._forecast_seq_len[i])
+            offset = (self.seq_len[i] - forecast_horizon) * to_offset(freq)
+            warmup_offsets.append(reference_ts + offset - reference_ts)
+        max_warmup = max(warmup_offsets) if warmup_offsets else pd.Timedelta(0)
 
-        basin_datasets = []
+        hist_start_limit = None
+        if forecast_start is not None:
+            hist_start_limit = forecast_start - max_warmup
+        hist_end_limit = historical_end
+        issue_start_limit = forecast_start
+        issue_end_limit = forecast_end
+
+        retry_attempts, retry_delay = self._get_retry_config()
+        basin_datasets: List[xr.Dataset] = []
         basins_without_data: List[str] = []
+        global_hist_start: Optional[pd.Timestamp] = None
+        global_hist_end: Optional[pd.Timestamp] = None
+        global_issue_start: Optional[pd.Timestamp] = None
+        global_issue_end: Optional[pd.Timestamp] = None
 
         for basin in self.basins:
             if 'basin' not in historical_ds.coords or basin not in historical_ds['basin'].values:
@@ -170,68 +277,55 @@ class OnlineForecastDataset(GenericDataset):
                 LOGGER.warning("Forecast data not available for basin %s - skipping.", basin)
                 basins_without_data.append(basin)
                 continue
-            if basin not in self.start_and_end_dates:
-                LOGGER.warning("No temporal configuration found for basin %s - skipping.", basin)
+
+            hist_basin = historical_ds.sel(basin=basin, drop=False).sortby('time')
+            if hist_start_limit is not None or hist_end_limit is not None:
+                hist_basin = hist_basin.sel(time=slice(hist_start_limit, hist_end_limit))
+            if hist_basin['time'].size == 0:
+                LOGGER.warning("Historical slice empty for basin %s - skipping.", basin)
+                basins_without_data.append(basin)
+                continue
+            hist_basin = hist_basin.load()
+
+            fcst_basin = self._materialize_forecast_slice(
+                fcst_basin=forecast_ds.sel(basin=basin, drop=False),
+                basin=basin,
+                start_date=issue_start_limit,
+                end_date=issue_end_limit,
+                attempts=retry_attempts,
+                delay=retry_delay,
+            )
+            if fcst_basin['issue_time'].size == 0:
+                LOGGER.warning("Forecast slice empty for basin %s - skipping.", basin)
                 basins_without_data.append(basin)
                 continue
 
-            hist_basin = historical_ds.sel(basin=basin, drop=False)
-            fcst_basin = forecast_ds.sel(basin=basin, drop=False)
+            hist_basin = hist_basin.sortby('time')
+            fcst_basin = fcst_basin.sortby('issue_time')
 
-            native_frequency = utils.infer_frequency(hist_basin['time'].values) or self.frequencies[0]
-
-            start_dates = self.start_and_end_dates[basin]["start_dates"]
-            end_dates = [date + pd.Timedelta(days=1, seconds=-1)
-                         for date in self.start_and_end_dates[basin]["end_dates"]]
-
-            hist_slices = []
-            fcst_slices = []
-
-            for start_date, end_date in zip(start_dates, end_dates):
-                warmup_start = min(start_date - offset for offset in offsets)
-
-                full_hist_index = pd.date_range(start=warmup_start,
-                                                end=end_date,
-                                                freq=native_frequency)
-                period_index = pd.date_range(start=start_date,
-                                             end=end_date,
-                                             freq=native_frequency)
-
-                hist_slice = hist_basin.sel(time=slice(warmup_start, end_date)).reindex({'time': full_hist_index})
-                fcst_slice = self._materialize_forecast_slice(
-                    fcst_basin=fcst_basin,
-                    basin=basin,
-                    start_date=start_date,
-                    end_date=end_date,
-                    attempts=retry_attempts,
-                    delay=retry_delay,
-                )
-
-                warmup_mask = hist_slice['time'] < np.datetime64(start_date)
-                for target_var in self.cfg.target_variables:
-                    if target_var in hist_slice.data_vars:
-                        hist_slice[target_var] = hist_slice[target_var].where(~warmup_mask, np.nan)
-
-                hist_slices.append(hist_slice)
-                fcst_slices.append(fcst_slice)
-
-            if not hist_slices or not fcst_slices:
-                LOGGER.warning("No temporal slices created for basin %s - skipping.", basin)
-                basins_without_data.append(basin)
-                continue
-
-            hist_combined = xr.concat(hist_slices, dim='time').sortby('time')
-            fcst_combined = xr.concat(fcst_slices, dim='issue_time').sortby('issue_time')
-
-            hist_index = pd.Index(hist_combined['time'].values)
+            hist_index = pd.Index(hist_basin['time'].values)
             if hist_index.duplicated().any():
-                hist_combined = hist_combined.isel(time=~hist_index.duplicated(keep='last'))
+                hist_basin = hist_basin.isel(time=~hist_index.duplicated(keep='last'))
 
-            fcst_index = pd.Index(fcst_combined['issue_time'].values)
+            fcst_index = pd.Index(fcst_basin['issue_time'].values)
             if fcst_index.duplicated().any():
-                fcst_combined = fcst_combined.isel(issue_time=~fcst_index.duplicated(keep='last'))
+                fcst_basin = fcst_basin.isel(issue_time=~fcst_index.duplicated(keep='last'))
 
-            basin_datasets.append(xr.merge([hist_combined, fcst_combined], compat='override'))
+            basin_datasets.append(xr.merge([hist_basin, fcst_basin], compat='override'))
+
+            basin_hist_start = pd.to_datetime(hist_basin['time'].values[0])
+            basin_hist_end = pd.to_datetime(hist_basin['time'].values[-1])
+            basin_issue_start = pd.to_datetime(fcst_basin['issue_time'].values[0])
+            basin_issue_end = pd.to_datetime(fcst_basin['issue_time'].values[-1])
+
+            if global_hist_start is None or basin_hist_start < global_hist_start:
+                global_hist_start = basin_hist_start
+            if global_hist_end is None or basin_hist_end > global_hist_end:
+                global_hist_end = basin_hist_end
+            if global_issue_start is None or basin_issue_start < global_issue_start:
+                global_issue_start = basin_issue_start
+            if global_issue_end is None or basin_issue_end > global_issue_end:
+                global_issue_end = basin_issue_end
 
         if basins_without_data:
             LOGGER.info("Skipped basins without complete data: %s", sorted(set(basins_without_data)))
@@ -241,7 +335,18 @@ class OnlineForecastDataset(GenericDataset):
                 raise NoTrainDataError
             raise NoEvaluationDataError
 
-        return xr.concat(basin_datasets, dim='basin')
+        merged = xr.concat(basin_datasets, dim='basin')
+        merged.attrs['onlineforecast_cache_version'] = self.CACHE_VERSION
+        availability = self._availability
+        merged.attrs.update(availability.to_attrs())
+        if global_hist_start is not None:
+            merged.attrs['cache_hist_start'] = str(global_hist_start)
+            merged.attrs['cache_hist_end'] = str(global_hist_end)
+        if global_issue_start is not None:
+            merged.attrs['cache_issue_start'] = str(global_issue_start)
+            merged.attrs['cache_issue_end'] = str(global_issue_end)
+
+        return merged
 
     def _load_cached_dataset(self, train_data_file: Optional[Path]) -> Optional[xr.Dataset]:
         for cache_path in self._cache_candidates(train_data_file):
@@ -250,6 +355,19 @@ class OnlineForecastDataset(GenericDataset):
 
             LOGGER.info("Loading cached dataset from %s", cache_path)
             dataset = xr.open_zarr(store=cache_path, decode_timedelta=True)
+            cache_version = dataset.attrs.get('onlineforecast_cache_version')
+            if cache_version != self.CACHE_VERSION:
+                LOGGER.info("Cached dataset version %s does not match expected %s. Rebuilding cache.",
+                            cache_version, self.CACHE_VERSION)
+                try:
+                    dataset.close()
+                except AttributeError:
+                    pass
+                if cache_path.is_dir():
+                    shutil.rmtree(cache_path)
+                else:
+                    cache_path.unlink()
+                continue
             if not self.frequencies:
                 native_frequency = utils.infer_frequency(dataset["time"].values)
                 self.frequencies = [native_frequency]
@@ -271,6 +389,9 @@ class OnlineForecastDataset(GenericDataset):
                 cache_path.unlink()
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         LOGGER.info("Saving materialized dataset to %s", cache_path)
+        if dataset.attrs.get('onlineforecast_cache_version') != self.CACHE_VERSION:
+            dataset.attrs['onlineforecast_cache_version'] = self.CACHE_VERSION
+            dataset.attrs.update(self._availability.to_attrs())
         dataset.chunk({'basin': max(1, len(self.basins))}).to_zarr(store=cache_path, mode='w')
 
     def _cache_candidates(self, train_data_file: Optional[Path]) -> List[Path]:
@@ -286,23 +407,128 @@ class OnlineForecastDataset(GenericDataset):
             dataset_dict = pickle.load(fp)
         return xr.Dataset.from_dict(dataset_dict)
 
+    def _ensure_scaler(self,
+                       period: str,
+                       scaler: Dict[str, Union[pd.Series, xr.DataArray]],
+                       cfg: Config) -> Dict[str, Union[pd.Series, xr.DataArray]]:
+        if period not in ['validation', 'test'] or scaler:
+            return scaler
+
+        train_dir = getattr(cfg, 'train_dir', None)
+        if train_dir is None:
+            raise ValueError("cfg.train_dir must be set to automatically load the scaler for validation/test periods")
+
+        try:
+            return self._load_scaler(Path(train_dir))
+        except FileNotFoundError as exc:  # noqa: B904
+            raise ValueError("Scaler not provided and automatic loading from cfg.train_dir failed.") from exc
+
+    def _load_scaler(self, train_dir: Path) -> Dict[str, Union[pd.Series, xr.Dataset]]:
+        try:
+            scaler = utils.load_scaler(train_dir)
+            LOGGER.info("Loaded scaler from %s/train_data/train_data_scaler.yml", train_dir)
+            return scaler
+        except FileNotFoundError:
+            pass
+
+        yaml_path = train_dir / "train_data_scaler.yml"
+        pickle_path = train_dir / "train_data_scaler.p"
+
+        if yaml_path.exists():
+            LOGGER.info("Loaded scaler from %s", yaml_path)
+            with yaml_path.open("r") as fp:
+                yaml_loader = YAML(typ="safe")
+                scaler_dump = yaml_loader.load(fp)
+
+            return self._deserialize_scaler_dict(scaler_dump)
+
+        if pickle_path.exists():
+            LOGGER.info("Loaded scaler from %s", pickle_path)
+            with pickle_path.open('rb') as fp:
+                return pickle.load(fp)
+
+        raise FileNotFoundError(f"No scaler file found under {train_dir} (checked train_data folder and direct files).")
+
+    @staticmethod
+    def _deserialize_scaler_dict(scaler_dump: Dict[str, Dict]) -> Dict[str, Union[pd.Series, xr.Dataset]]:
+        scaler: Dict[str, Union[pd.Series, xr.Dataset]] = {}
+        for key, value in scaler_dump.items():
+            if key in ["attribute_means", "attribute_stds", "camels_attr_means", "camels_attr_stds"]:
+                scaler[key] = pd.Series(value)
+            elif key in ["xarray_feature_scale", "xarray_feature_center"]:
+                scaler[key] = xr.Dataset.from_dict(value).astype(np.float32)
+        return scaler
+
+    def _update_data_availability(self,
+                                  historical_ds: Optional[xr.Dataset] = None,
+                                  forecast_ds: Optional[xr.Dataset] = None,
+                                  merged_ds: Optional[xr.Dataset] = None) -> None:
+        if historical_ds is not None:
+            self._availability.update_from_dataset(historical_ds, 'time', 'historical')
+        if forecast_ds is not None:
+            self._availability.update_from_dataset(forecast_ds, 'issue_time', 'forecast')
+
+        if merged_ds is None:
+            return
+
+        self._availability.update_from_dataset(merged_ds, 'time', 'historical')
+        issue_dim = 'issue_time' if 'issue_time' in merged_ds.coords else (
+            'init_time' if 'init_time' in merged_ds.coords else None)
+        if issue_dim is not None:
+            self._availability.update_from_dataset(merged_ds, issue_dim, 'forecast')
+
+        self._availability.update_from_attrs(merged_ds.attrs)
+
+    def _filter_issue_times_for_period(self, basin: str, issue_times: np.ndarray) -> np.ndarray:
+        if issue_times.size == 0:
+            return issue_times
+
+        start_dates = self.start_and_end_dates.get(basin, {}).get('start_dates', [])
+        end_dates = self.start_and_end_dates.get(basin, {}).get('end_dates', [])
+        start_dates = [pd.to_datetime(date) for date in start_dates]
+        end_dates = [pd.to_datetime(date) for date in end_dates]
+
+        issue_index = pd.to_datetime(issue_times)
+        if start_dates and end_dates:
+            adjusted_end_dates = [end_date + pd.Timedelta(days=1, seconds=-1) for end_date in end_dates]
+            mask = np.zeros(issue_index.size, dtype=bool)
+            for start_date, end_date in zip(start_dates, adjusted_end_dates):
+                mask |= (issue_index >= start_date) & (issue_index <= end_date)
+        else:
+            mask = np.ones(issue_index.size, dtype=bool)
+
+        forecast_start = self._availability.forecast_start
+        forecast_end = self._availability.forecast_end
+        if forecast_start is not None:
+            mask &= issue_index >= forecast_start
+        if forecast_end is not None:
+            mask &= issue_index <= forecast_end
+
+        return issue_index[mask].to_numpy(dtype='datetime64[ns]')
+
     def _get_retry_config(self) -> Tuple[int, float]:
-        attempts = getattr(self.cfg, 'forecast_load_retries', 3) or 1
+        attempts = getattr(self.cfg, 'forecast_load_retries', 5) or 1
         delay = getattr(self.cfg, 'forecast_load_retry_delay', 5) or 0
         return max(1, int(attempts)), max(0.0, float(delay))
 
     def _materialize_forecast_slice(self,
                                     fcst_basin: xr.Dataset,
                                     basin: str,
-                                    start_date: pd.Timestamp,
-                                    end_date: pd.Timestamp,
+                                    start_date: Optional[pd.Timestamp],
+                                    end_date: Optional[pd.Timestamp],
                                     attempts: int,
                                     delay: float) -> xr.Dataset:
         last_exception: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
             try:
-                fcst_slice = fcst_basin.sel(time=slice(start_date, end_date))
-                fcst_slice = fcst_slice.rename({'time': 'issue_time'})
+                issue_dim = 'issue_time' if 'issue_time' in fcst_basin.dims else (
+                    'time' if 'time' in fcst_basin.dims else None)
+                if issue_dim is None:
+                    raise ValueError('Forecast dataset must include an issue_time dimension.')
+                slice_kwargs = {issue_dim: slice(start_date, end_date)}
+                fcst_slice = fcst_basin.sel(slice_kwargs)
+                if issue_dim != 'issue_time':
+                    fcst_slice = fcst_slice.rename({issue_dim: 'issue_time'})
                 return fcst_slice.load()
             except Exception as exc:  # noqa: BLE001 - log and retry specific fetch errors
                 last_exception = exc
@@ -627,6 +853,14 @@ class OnlineForecastDataset(GenericDataset):
                 basins_without_samples.append(basin)
                 continue
 
+            filtered_issue_times = self._filter_issue_times_for_period(basin, basin_fcst[issue_dim].values)
+            if filtered_issue_times.size == 0:
+                LOGGER.warning("No forecast issue times within configured period for basin %s - skipping.", basin)
+                basins_without_samples.append(basin)
+                continue
+
+            basin_fcst = basin_fcst.sel({issue_dim: filtered_issue_times})
+
             forecast_df = basin_fcst.to_dataframe().reset_index().set_index([issue_dim, 'lead_time']).sort_index()
             if forecast_df.empty:
                 LOGGER.warning("Forecast data empty for basin %s - skipping.", basin)
@@ -743,7 +977,11 @@ class OnlineForecastDataset(GenericDataset):
                 self._issue_times[basin][freq] = issue_time_values
 
             if not self.is_train:
-                self.period_starts[basin] = pd.to_datetime(date_values[0])
+                start_dates = self.start_and_end_dates.get(basin, {}).get('start_dates', [])
+                if start_dates:
+                    self.period_starts[basin] = pd.to_datetime(start_dates[0])
+                else:
+                    self.period_starts[basin] = pd.to_datetime(date_values[0])
 
             for idx in valid_indices:
                 pointers = []
@@ -771,14 +1009,9 @@ class OnlineForecastDataset(GenericDataset):
         """Validate that configured time periods are within available data ranges.
         
         This method checks that all configured train, validation, and test periods
-        fall within the available data ranges for both historical and forecast data:
-        
-        - Historical data: available until 2024-04-30 23:00:00
-        - Forecast data: available from 2020-10-01 00:00:00 onwards
-        
-        For periods that require both historical and forecast data, both constraints
-        must be satisfied.
-        
+        fall within the available data ranges for both historical and forecast data
+        that were detected while loading the datasets.
+
         Parameters
         ----------
         cfg : Config
@@ -789,13 +1022,19 @@ class OnlineForecastDataset(GenericDataset):
         ValueError
             If any configured period extends outside available data ranges
         """
-        # Define data availability constraints
-        historical_data_end = pd.to_datetime('2024-04-30 23:00:00')
-        forecast_data_start = pd.to_datetime('2020-10-01 00:00:00')
-        
+        availability = self._availability
+        historical_end = availability.historical_end
+        forecast_start = availability.forecast_start
+        historical_start = availability.historical_start
+        forecast_end = availability.forecast_end
+
+        if historical_end is None or forecast_start is None:
+            LOGGER.warning("Data availability bounds are unknown. Skipping validation.")
+            return
+
         LOGGER.info("Validating data availability against configured time periods...")
-        LOGGER.info(f"  Historical data available until: {historical_data_end}")
-        LOGGER.info(f"  Forecast data available from: {forecast_data_start}")
+        LOGGER.info(f"  Historical coverage: {historical_start} to {historical_end}")
+        LOGGER.info(f"  Forecast coverage: {forecast_start} to {forecast_end}")
         
         # Collect all configured periods
         periods_to_check = []
@@ -829,29 +1068,30 @@ class OnlineForecastDataset(GenericDataset):
             LOGGER.info(f"  Checking {period_name} period: {period_start.date()} to {period_end.date()}")
             
             # Check if period requires forecast data (overlaps with forecast availability)
-            needs_forecast_data = period_end >= forecast_data_start
+            needs_forecast_data = forecast_start is not None and period_end >= forecast_start
             
             # Check if period requires historical data (starts before or overlaps with historical availability)
-            needs_historical_data = period_start <= historical_data_end
+            needs_historical_data = historical_end is not None and period_start <= historical_end
             
             # Validate forecast data availability
-            if needs_forecast_data and period_start < forecast_data_start:
-                gap_days = (forecast_data_start - period_start).days
+            if needs_forecast_data and period_start < forecast_start:
+                gap_days = (forecast_start - period_start).days
                 errors.append(
                     f"{period_name.capitalize()} period starts {gap_days} days before forecast data becomes available. "
-                    f"Period starts: {period_start.date()}, forecast data starts: {forecast_data_start.date()}"
+                    f"Period starts: {period_start.date()}, forecast data starts: {forecast_start.date()}"
                 )
             
             # Validate historical data availability  
-            if needs_historical_data and period_end > historical_data_end:
-                gap_days = (period_end - historical_data_end).days
+            if needs_historical_data and period_end > historical_end:
+                gap_days = (period_end - historical_end).days
                 errors.append(
                     f"{period_name.capitalize()} period extends {gap_days} days beyond available historical data. "
-                    f"Period ends: {period_end.date()}, historical data ends: {historical_data_end.date()}"
+                    f"Period ends: {period_end.date()}, historical data ends: {historical_end.date()}"
                 )
             
             # Check for periods that fall entirely outside available data ranges
-            if period_end < forecast_data_start and period_start > historical_data_end:
+            if (forecast_start is not None and period_end < forecast_start) and \
+               (historical_end is not None and period_start > historical_end):
                 errors.append(
                     f"{period_name.capitalize()} period falls entirely outside available data ranges. "
                     f"Period: {period_start.date()} to {period_end.date()}"
@@ -859,21 +1099,21 @@ class OnlineForecastDataset(GenericDataset):
             
             # For OnlineForecastDataset, periods without forecast data are considered errors
             # since this dataset is specifically designed for forecast operations
-            if period_end < forecast_data_start and needs_historical_data:
-                gap_days = (forecast_data_start - period_end).days
+            if forecast_start is not None and period_end < forecast_start and needs_historical_data:
+                gap_days = (forecast_start - period_end).days
                 errors.append(
                     f"{period_name.capitalize()} period ends {gap_days} days before forecast data becomes available. "
                     f"OnlineForecastDataset requires forecast data availability. "
-                    f"Period ends: {period_end.date()}, forecast data starts: {forecast_data_start.date()}"
+                    f"Period ends: {period_end.date()}, forecast data starts: {forecast_start.date()}"
                 )
             
             # Also error for periods that start after historical data ends (no historical context)
-            if period_start > historical_data_end:
-                gap_days = (period_start - historical_data_end).days
+            if historical_end is not None and period_start > historical_end:
+                gap_days = (period_start - historical_end).days
                 errors.append(
                     f"{period_name.capitalize()} period starts {gap_days} days after historical data ends. "
                     f"No historical context available for model training/evaluation. "
-                    f"Period starts: {period_start.date()}, historical data ends: {historical_data_end.date()}"
+                    f"Period starts: {period_start.date()}, historical data ends: {historical_end.date()}"
                 )
         
         # Log warnings
@@ -887,8 +1127,8 @@ class OnlineForecastDataset(GenericDataset):
                 error_msg += f"{i}. {error}\n"
             
             error_msg += f"\nAvailable data ranges:\n"
-            error_msg += f"  • Historical data: up to {historical_data_end.date()} {historical_data_end.time()}\n"
-            error_msg += f"  • Forecast data: from {forecast_data_start.date()} {forecast_data_start.time()} onwards\n\n"
+            error_msg += f"  • Historical data: up to {historical_end.date()} {historical_end.time()}\n"
+            error_msg += f"  • Forecast data: from {forecast_start.date()} {forecast_start.time()} onwards\n\n"
             error_msg += f"Suggested fixes:\n"
             error_msg += f"  • Adjust configured date ranges to fall within available data periods\n"
             error_msg += f"  • Update data sources to extend availability ranges"
