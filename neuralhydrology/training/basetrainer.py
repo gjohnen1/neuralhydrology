@@ -391,8 +391,14 @@ class BaseTrainer(object):
 
         # create folder + necessary subfolder
         if not self.cfg.run_dir.is_dir():
-            self.cfg.train_dir = self.cfg.run_dir / "train_data"
-            self.cfg.train_dir.mkdir(parents=True)
+            train_dir_override = getattr(self.cfg, "train_dir", None)
+            if train_dir_override:
+                self.cfg.train_dir = Path(train_dir_override)
+            else:
+                self.cfg.train_dir = self.cfg.run_dir / "train_data"
+            self.cfg.train_dir.mkdir(parents=True, exist_ok=True)
+            if train_dir_override:
+                LOGGER.info("Using pre-configured train_dir at %s", self.cfg.train_dir)
         else:
             raise RuntimeError(f"There is already a folder at {self.cfg.run_dir}")
         if self.cfg.log_n_figures is not None:
