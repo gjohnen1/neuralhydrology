@@ -61,10 +61,21 @@ model: handoff_forecast_lstm
 checkpoint_path:
 
 # prediction head [regression]. Define the head specific parameters below
-head: regression
+head: cmal
+
+# ----> CMAL settings <----
+
+# number of components
+n_distributions: 3
+
+# sampling behaviour during inference
+n_samples: 500
+
+# how to account for negative samples 
+negative_sample_handling: clip
 
 # ----> Regression settings <----
-output_activation: linear
+# output_activation: linear
 
 # ----> Embedding network settings <----
 
@@ -152,7 +163,7 @@ output_dropout: 0.4
 optimizer: Adam
 
 # specify loss [MSE, NSE, RMSE]
-loss: MSE
+loss: CMALLoss
 
 # add regularization terms.
 # Options: tie_frequencies (couples the different frequencies' predictions in an MSE error term)
@@ -242,10 +253,6 @@ save_train_data: True # Dataset of size 4GB takes long to save atm.
 
 # If existing train data file exist, specify path to the pickle file here
 train_data_file:
-
-# Forcing product [daymet, maurer, maurer_extended, nldas, nldas_extended, nldas_hourly]
-# can be either a list of forcings or a single forcing product
-forcings: maurer_extended
 
 # variables to use as time series input (names match the data file column headers)
 # Note: In case of multiple input forcing products, you have to append the forcing product behind
