@@ -861,6 +861,9 @@ class OnlineForecastDataset(GenericDataset):
 
             basin_fcst = basin_fcst.sel({issue_dim: filtered_issue_times})
 
+            # Explicitly load into memory to avoid dask/to_dataframe issues and get better error messages
+            basin_fcst = basin_fcst.load()
+
             forecast_df = basin_fcst.to_dataframe().reset_index().set_index([issue_dim, 'lead_time']).sort_index()
             if forecast_df.empty:
                 LOGGER.warning("Forecast data empty for basin %s - skipping.", basin)
@@ -1191,3 +1194,24 @@ class OnlineForecastDataset(GenericDataset):
             
             LOGGER.error(error_msg)
             raise ValueError(error_msg)
+    
+    @staticmethod
+    def collate_fn(
+            samples: List[Dict[str, Union[torch.Tensor, np.ndarray, Dict[str, torch.Tensor]]]]
+    ) -> Dict[str, Union[torch.Tensor, np.ndarray, Dict[str, torch.Tensor]]]:
+        batch = {}
+        if not samples:
+            return batch
+        features = list(samples[0].keys())
+        for feature in features:
+            if feature.startswith('date') or feature.startswith('issue_time'):
+                # Dates and issue times are stored as a numpy array of datetime64, which we maintain as numpy array.
+                batch[feature] = np.stack([sample[feature] for sample in samples], axis=0)
+            elif feature.startswith('x_d'):
+                # Dynamics are stored as dictionaries with feature names as keys.
+                batch[feature] = {k: torch.stack([sample[feature][k] for sample in samples], dim=0)
+                                  for k in samples[0][feature]}
+            else:
+                # Everything else is a torch.Tensor.
+                batch[feature] = torch.stack([sample[feature] for sample in samples], dim=0)
+        return batch
