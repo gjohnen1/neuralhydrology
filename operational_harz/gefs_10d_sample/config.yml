@@ -232,7 +232,7 @@ dataset: onlineforecast
 data_dir: ./data/harz
 
 # Path to the directory where the training data should be stored
-train_dir: ./operational_harz/runs
+train_dir: ./operational_harz/gefs_10d_sample/runs
 
 # Time series data subdirectory 
 time_series_data_sub_dir: timeseries
