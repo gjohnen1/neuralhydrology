@@ -186,18 +186,18 @@ class OnlineForecastDataset(GenericDataset):
             self._validate_data_availability(self.cfg)
             return cached_dataset
 
-        if train_data_file is None or not self.is_train:
-            dataset = self._build_dataset_from_sources()
-            if self.is_train and self.cfg.save_train_data:
-                self._save_dataset_cache(dataset)
+        if train_data_file is not None and Path(train_data_file).exists():
+            dataset = self._load_pickled_dataset(Path(train_data_file))
+            if not self.frequencies:
+                native_frequency = utils.infer_frequency(dataset["time"].values)
+                self.frequencies = [native_frequency]
+            self._update_data_availability(merged_ds=dataset)
             self._validate_data_availability(self.cfg)
             return dataset
 
-        dataset = self._load_pickled_dataset(Path(train_data_file))
-        if not self.frequencies:
-            native_frequency = utils.infer_frequency(dataset["time"].values)
-            self.frequencies = [native_frequency]
-        self._update_data_availability(merged_ds=dataset)
+        dataset = self._build_dataset_from_sources()
+        if self.is_train and self.cfg.save_train_data:
+            self._save_dataset_cache(dataset)
         self._validate_data_availability(self.cfg)
         return dataset
 
@@ -782,10 +782,22 @@ class OnlineForecastDataset(GenericDataset):
 
             sample[f'x_h{freq_suffix}'] = self._x_h[basin][freq][hindcast_start_idx:hindcast_end_idx]
             sample[f'x_f{freq_suffix}'] = self._x_f[basin][freq][forecast_idx]
+            
+            # Create dictionaries for InputLayer compatibility
+            # InputLayer expects x_d_hindcast and x_d_forecast as dictionaries of tensors (seq_len, 1)
+            sample[f'x_d_hindcast{freq_suffix}'] = {
+                k: sample[f'x_h{freq_suffix}'][:, i].unsqueeze(-1) 
+                for i, k in enumerate(self.cfg.hindcast_inputs)
+            }
+            sample[f'x_d_forecast{freq_suffix}'] = {
+                k: sample[f'x_f{freq_suffix}'][:, i].unsqueeze(-1)
+                for i, k in enumerate(self.cfg.forecast_inputs)
+            }
+
             sample[f'y{freq_suffix}'] = self._y[basin][freq][hindcast_start_idx:global_end_idx]
             sample[f'date{freq_suffix}'] = self._dates[basin][freq][hindcast_start_idx:global_end_idx]
             if issue_time is not None:
-                sample[f'issue_time{freq_suffix}'] = issue_time
+                sample[f'date_issue{freq_suffix}'] = issue_time
 
             # Handle static inputs
             static_inputs = []
@@ -1194,24 +1206,4 @@ class OnlineForecastDataset(GenericDataset):
             
             LOGGER.error(error_msg)
             raise ValueError(error_msg)
-    
-    @staticmethod
-    def collate_fn(
-            samples: List[Dict[str, Union[torch.Tensor, np.ndarray, Dict[str, torch.Tensor]]]]
-    ) -> Dict[str, Union[torch.Tensor, np.ndarray, Dict[str, torch.Tensor]]]:
-        batch = {}
-        if not samples:
-            return batch
-        features = list(samples[0].keys())
-        for feature in features:
-            if feature.startswith('date') or feature.startswith('issue_time'):
-                # Dates and issue times are stored as a numpy array of datetime64, which we maintain as numpy array.
-                batch[feature] = np.stack([sample[feature] for sample in samples], axis=0)
-            elif feature.startswith('x_d'):
-                # Dynamics are stored as dictionaries with feature names as keys.
-                batch[feature] = {k: torch.stack([sample[feature][k] for sample in samples], dim=0)
-                                  for k in samples[0][feature]}
-            else:
-                # Everything else is a torch.Tensor.
-                batch[feature] = torch.stack([sample[feature] for sample in samples], dim=0)
-        return batch
+
