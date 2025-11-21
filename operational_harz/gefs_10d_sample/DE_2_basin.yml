@@ -61,21 +61,10 @@ model: handoff_forecast_lstm
 checkpoint_path:
 
 # prediction head [regression]. Define the head specific parameters below
-head: cmal
-
-# ----> CMAL settings <----
-
-# number of components
-n_distributions: 3
-
-# sampling behaviour during inference
-n_samples: 500
-
-# how to account for negative samples 
-negative_sample_handling: clip
+head: regression
 
 # ----> Regression settings <----
-# output_activation: linear
+output_activation: linear
 
 # ----> Embedding network settings <----
 
@@ -163,7 +152,7 @@ output_dropout: 0.4
 optimizer: Adam
 
 # specify loss [MSE, NSE, RMSE]
-loss: CMALLoss
+loss: MSE
 
 # add regularization terms.
 # Options: tie_frequencies (couples the different frequencies' predictions in an MSE error term)
