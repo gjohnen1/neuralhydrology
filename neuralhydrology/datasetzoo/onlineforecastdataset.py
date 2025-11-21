@@ -776,9 +776,12 @@ class OnlineForecastDataset(GenericDataset):
             issue_time = pointer.get('issue_time')
 
             hindcast_history = seq_len - forecast_seq_len
-            hindcast_start_idx = hindcast_idx + self._forecast_offset - hindcast_history
-            hindcast_end_idx = hindcast_idx + self._forecast_offset
-            global_end_idx = hindcast_idx + self._forecast_offset + forecast_seq_len
+            # We want the hindcast to include the issue_time, so we shift the window by +1
+            # hindcast_idx is the index of issue_time. Slicing [start:end] excludes end.
+            # So to include issue_time, end must be hindcast_idx + 1.
+            hindcast_start_idx = hindcast_idx + self._forecast_offset - hindcast_history + 1
+            hindcast_end_idx = hindcast_idx + self._forecast_offset + 1
+            global_end_idx = hindcast_idx + self._forecast_offset + forecast_seq_len + 1
 
             sample[f'x_h{freq_suffix}'] = self._x_h[basin][freq][hindcast_start_idx:hindcast_end_idx]
             sample[f'x_f{freq_suffix}'] = self._x_f[basin][freq][forecast_idx]
@@ -888,17 +891,21 @@ class OnlineForecastDataset(GenericDataset):
                 basins_without_samples.append(basin)
                 continue
 
-            available_hindcast = [col for col in self.cfg.hindcast_inputs if col in hindcast_df.columns]
-            if not available_hindcast:
-                raise ValueError(f'No hindcast inputs available for basin {basin}. Check cfg.hindcast_inputs.')
+            # Verify all configured features are present
+            missing_hindcast = set(self.cfg.hindcast_inputs) - set(hindcast_df.columns)
+            if missing_hindcast:
+                raise ValueError(f'Missing hindcast inputs for basin {basin}: {missing_hindcast}')
+            available_hindcast = self.cfg.hindcast_inputs
 
-            available_targets = [col for col in self.cfg.target_variables if col in hindcast_df.columns]
-            if not available_targets:
-                raise ValueError(f'No target variables available for basin {basin}. Check cfg.target_variables.')
+            missing_targets = set(self.cfg.target_variables) - set(hindcast_df.columns)
+            if missing_targets:
+                raise ValueError(f'Missing target variables for basin {basin}: {missing_targets}')
+            available_targets = self.cfg.target_variables
 
-            available_forecast = [col for col in self.cfg.forecast_inputs if col in forecast_df.columns]
-            if not available_forecast:
-                raise ValueError(f'No forecast inputs available for basin {basin}. Check cfg.forecast_inputs.')
+            missing_forecast = set(self.cfg.forecast_inputs) - set(forecast_df.columns)
+            if missing_forecast:
+                raise ValueError(f'Missing forecast inputs for basin {basin}: {missing_forecast}')
+            available_forecast = self.cfg.forecast_inputs
 
             hindcast_matrix = hindcast_df[available_hindcast].to_numpy(dtype=np.float32)
             target_matrix = hindcast_df[available_targets].to_numpy(dtype=np.float32)
@@ -942,9 +949,10 @@ class OnlineForecastDataset(GenericDataset):
                     if anchor_idx < 0:
                         continue
 
-                    hindcast_start = anchor_idx + self._forecast_offset - hindcast_history
-                    hindcast_end = anchor_idx + self._forecast_offset
-                    forecast_end = anchor_idx + self._forecast_offset + self._forecast_seq_len[freq_idx]
+                    # Shifted by +1 to include issue_time in hindcast
+                    hindcast_start = anchor_idx + self._forecast_offset - hindcast_history + 1
+                    hindcast_end = anchor_idx + self._forecast_offset + 1
+                    forecast_end = anchor_idx + self._forecast_offset + self._forecast_seq_len[freq_idx] + 1
 
                     if hindcast_start < 0:
                         continue
