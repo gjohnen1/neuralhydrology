@@ -138,7 +138,7 @@ transformer_nheads: 4
 # ----> General settings <----
 
 # Number of cell states of the LSTM
-hidden_size: 64
+hidden_size: 128
 
 # Initial bias value of the forget gate
 initial_forget_bias: 3
@@ -152,7 +152,7 @@ output_dropout: 0.4
 optimizer: Adam
 
 # specify loss [MSE, NSE, RMSE]
-loss: MSE
+loss: NSE
 
 # add regularization terms.
 # Options: tie_frequencies (couples the different frequencies' predictions in an MSE error term)
@@ -162,14 +162,14 @@ regularization:
 # specify learning rates to use starting at specific epochs (0 is the initial learning rate)
 learning_rate:
     0: 1e-3
-    10: 5e-4
-    20: 1e-4
+    30: 5e-4
+    40: 1e-4
 
 # Mini-batch size
 batch_size: 256
 
 # Number of training epochs
-epochs: 30
+epochs: 50
 
 # adds noise with given std to the labels during training. Leave empty or set to 0 if not used.
 target_noise_std: 0.005
