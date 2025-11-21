@@ -6,6 +6,11 @@ import sys
 import time
 import warnings
 import os
+
+# Set Numba threading layer to 'workqueue' to avoid "Unable to join threads" warnings
+# when used with PyTorch DataLoader's multiprocessing.
+os.environ['NUMBA_THREADING_LAYER'] = 'workqueue'
+
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union, Optional
 
@@ -179,23 +184,35 @@ class OnlineForecastDataset(GenericDataset):
             self._predict_last_n = [self._predict_last_n]
 
     def _load_or_create_xarray_dataset(self) -> xr.Dataset:
+        """Load the dataset from cache or build it from sources."""
         train_data_file: Optional[Path] = getattr(self.cfg, 'train_data_file', None)
 
+        # 1. Try Zarr Cache (Preferred)
         cached_dataset = self._load_cached_dataset(train_data_file)
         if cached_dataset is not None:
             self._update_data_availability(merged_ds=cached_dataset)
             self._validate_data_availability(self.cfg)
             return cached_dataset
 
+        # 2. Try Pickle Cache (Legacy/Configured)
         if train_data_file is not None and Path(train_data_file).exists():
-            dataset = self._load_pickled_dataset(Path(train_data_file))
-            if not self.frequencies:
-                native_frequency = utils.infer_frequency(dataset["time"].values)
-                self.frequencies = [native_frequency]
-            self._update_data_availability(merged_ds=dataset)
-            self._validate_data_availability(self.cfg)
-            return dataset
+            # Check if it's actually a pickle (not a directory)
+            if Path(train_data_file).is_file():
+                LOGGER.info(f"Loading dataset from pickle file: {train_data_file}")
+                dataset = self._load_pickled_dataset(Path(train_data_file))
+                if not self.frequencies:
+                    native_frequency = utils.infer_frequency(dataset["time"].values)
+                    self.frequencies = [native_frequency]
+                self._update_data_availability(merged_ds=dataset)
+                self._validate_data_availability(self.cfg)
+                return dataset
 
+        # 3. Fetch from sources
+        LOGGER.info("No cached data found. Fetching from sources...")
+        return self._fetch_and_cache_data()
+
+    def _fetch_and_cache_data(self) -> xr.Dataset:
+        """Helper to build dataset from sources and optionally cache it."""
         dataset = self._build_dataset_from_sources()
         if self.is_train and self.cfg.save_train_data:
             self._save_dataset_cache(dataset)
