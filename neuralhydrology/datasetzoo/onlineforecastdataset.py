@@ -629,16 +629,9 @@ class OnlineForecastDataset(GenericDataset):
         try:
             LOGGER.info("Loading all available historical data from local CSV files...")
             
-            # Load ALL available data - don't constrain by period dates
-            # The warmup calculation will handle temporal slicing later
+            basin_datasets = []
             
-            basin_data = {}
-            basin_names = []
-            
-            # Load data for each basin
             for basin in self.basins:
-                basin_names.append(basin)
-                
                 # Construct file path
                 csv_file = self.cfg.data_dir / "timeseries" / f"hydromet_timeseries_{basin}.csv"
                 
@@ -662,52 +655,27 @@ class OnlineForecastDataset(GenericDataset):
                 
                 if keep_cols:
                     df = df[keep_cols]
-                    basin_data[basin] = df
+                    # Convert to xarray immediately per basin
+                    ds = xr.Dataset.from_dataframe(df)
+                    # Rename date to time to match expected convention
+                    if 'date' in ds.dims:
+                        ds = ds.rename({'date': 'time'})
+                    ds = ds.expand_dims(basin=[basin])
+                    basin_datasets.append(ds)
                     LOGGER.info(f"Loaded {len(df)} records for basin {basin} covering {df.index.min().date()} to {df.index.max().date()}")
                 else:
                     LOGGER.warning(f"No requested variables found for basin {basin}")
             
-            if not basin_data:
+            if not basin_datasets:
                 LOGGER.warning("No historical data loaded for any basin")
                 return None
             
-            # Convert to xarray Dataset
-            all_times = set()
-            for df in basin_data.values():
-                all_times.update(df.index)
-            all_times = sorted(list(all_times))
+            # Combine efficiently. 
+            LOGGER.info("Merging basin datasets...")
+            # This aligns all datasets along the time dimension (union of times) and concatenates along basin
+            historical_ds = xr.concat(basin_datasets, dim='basin')
             
-            # Get all variable names
-            sample_df = next(iter(basin_data.values()))
-            variable_names = sample_df.columns.tolist()
-            
-            # Create data arrays for each variable
-            data_vars = {}
-            for var_name in variable_names:
-                # Create 2D array: (basin, time)
-                data_array = np.full((len(basin_names), len(all_times)), np.nan)
-                
-                for i, basin_name in enumerate(basin_names):
-                    if basin_name in basin_data:
-                        df = basin_data[basin_name]
-                        if var_name in df.columns:
-                            # Reindex to match all_times, filling missing with NaN
-                            var_series = df[var_name].reindex(all_times)
-                            data_array[i, :] = var_series.values
-                
-                data_vars[var_name] = (['basin', 'time'], data_array)
-            
-            # Create coordinates
-            coords = {
-                'basin': basin_names,
-                'time': all_times
-            }
-            
-            # Create Dataset
-            historical_ds = xr.Dataset(data_vars, coords=coords)
-            
-            
-            LOGGER.info(f"Created historical dataset with {len(basin_names)} basins, {len(all_times)} time steps, and variables: {variable_names}")
+            LOGGER.info(f"Created historical dataset with {len(basin_datasets)} basins.")
             return historical_ds
             
         except Exception as e:
