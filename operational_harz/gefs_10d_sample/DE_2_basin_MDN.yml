@@ -64,10 +64,11 @@ checkpoint_path:
 head: cmal
 
 # ----> MDN settings <----
-output_activation: linear
-n_distributions: 8
+n_distributions: 3
 # output_distribution: cmal
 n_samples: 100
+# how to account for negative samples 
+negative_sample_handling: clip
 
 # ----> Embedding network settings <----
 
