@@ -12,12 +12,12 @@ validation_basin_file: basins.txt
 test_basin_file: basins.txt
 
 # training, validation and test time periods (format = 'dd/mm/yyyy')
-train_start_date: "01/10/2020"
+train_start_date: "01/10/2020" # Forecast archive start
 train_end_date: "30/09/2023"
 validation_start_date: "01/10/2023"
 validation_end_date: "31/01/2024"
 test_start_date: "01/02/2024"
-test_end_date: "30/04/2024"
+test_end_date: "30/04/2024" # Historic data end
 
 # if you want to use different (continuous or split) periods per basin (and period) define path to pickle files here.
 per_basin_train_periods_file:
