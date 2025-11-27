@@ -5,13 +5,8 @@ import shutil
 import sys
 import time
 import warnings
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Union, Optional
-
-# Set Numba threading layer to 'workqueue' to avoid "Unable to join threads" warnings
-# when used with PyTorch DataLoader's multiprocessing.
-os.environ['NUMBA_THREADING_LAYER'] = 'workqueue'
 
 import numpy as np
 import pandas as pd
@@ -21,12 +16,6 @@ from pandas.tseries.frequencies import to_offset
 from ruamel.yaml import YAML
 from tqdm import tqdm
 
-try:
-    from numba import njit
-except ImportError:
-    def njit(func):
-        return func
-
 from neuralhydrology.datasetzoo.genericdataset import GenericDataset
 from neuralhydrology.datautils import utils
 from neuralhydrology.utils.config import Config
@@ -34,58 +23,6 @@ from neuralhydrology.utils.errors import NoEvaluationDataError, NoTrainDataError
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-@njit
-def _check_validity_numba(hindcast_positions: np.ndarray,
-                          hindcast_clean_mask: np.ndarray,
-                          target_data_mask: np.ndarray,
-                          forecast_clean_mask: np.ndarray,
-                          forecast_offset: int,
-                          hindcast_history: int,
-                          forecast_seq_len: int,
-                          predict_last_n: int,
-                          is_train: bool) -> np.ndarray:
-    n_issues = len(hindcast_positions)
-    validity = np.zeros(n_issues, dtype=np.bool_)
-    n_hindcast_steps = len(hindcast_clean_mask)
-
-    for i in range(n_issues):
-        anchor_idx = hindcast_positions[i]
-        
-        if anchor_idx < 0:
-            continue
-
-        # Shifted by +1 to include issue_time in hindcast
-        hindcast_start = anchor_idx + forecast_offset - hindcast_history + 1
-        hindcast_end = anchor_idx + forecast_offset + 1
-        forecast_end = anchor_idx + forecast_offset + forecast_seq_len + 1
-
-        if hindcast_start < 0:
-            continue
-        if forecast_end > n_hindcast_steps:
-            continue
-
-        if is_train:
-            # Check hindcast for NaNs (all steps must be clean)
-            # Note: .all() on boolean array is fast
-            if not hindcast_clean_mask[hindcast_start:hindcast_end].all():
-                continue
-
-            # Check forecast for NaNs (pre-computed per issue)
-            if not forecast_clean_mask[i]:
-                continue
-
-            # Check targets for NaNs (only if predict_last_n > 0)
-            if predict_last_n > 0:
-                # We need at least one valid target in the tail
-                tail_has_data = target_data_mask[forecast_end - predict_last_n:forecast_end]
-                if tail_has_data.size > 0 and not tail_has_data.any():
-                    continue
-        
-        validity[i] = True
-        
-    return validity
 
 
 @dataclass
@@ -968,34 +905,45 @@ class OnlineForecastDataset(GenericDataset):
             self._dates.setdefault(basin, {})
             self._issue_times.setdefault(basin, {})
 
-            # Pre-compute validity masks to speed up the Numba loop
-            # True if the row has NO NaNs
-            hindcast_clean_mask = ~np.isnan(hindcast_matrix).any(axis=1)
-            # True if the row has ANY data (not all NaNs)
-            target_data_mask = ~np.isnan(target_matrix).all(axis=1)
-
             validity_masks: List[np.ndarray] = []
             for freq_idx, freq in enumerate(self.frequencies):
                 hindcast_history = self.seq_len[freq_idx] - self._forecast_seq_len[freq_idx]
                 if hindcast_history <= 0:
                     raise ValueError('seq_length must exceed forecast_seq_length to provide hindcast context.')
 
-                # Pre-compute forecast validity for this frequency's sequence length
-                # True if the issue has NO NaNs in the relevant window
-                current_fc_seq_len = self._forecast_seq_len[freq_idx]
-                forecast_clean_mask = ~np.isnan(fc_tensor[:, :current_fc_seq_len, :]).any(axis=(1, 2))
+                validity = np.zeros(len(issue_times), dtype=bool)
 
-                validity = _check_validity_numba(
-                    hindcast_positions=hindcast_positions,
-                    hindcast_clean_mask=hindcast_clean_mask,
-                    target_data_mask=target_data_mask,
-                    forecast_clean_mask=forecast_clean_mask,
-                    forecast_offset=self._forecast_offset,
-                    hindcast_history=hindcast_history,
-                    forecast_seq_len=current_fc_seq_len,
-                    predict_last_n=self._predict_last_n[freq_idx],
-                    is_train=self.is_train
-                )
+                for candidate_idx, anchor_idx in enumerate(hindcast_positions):
+                    if anchor_idx < 0:
+                        continue
+
+                    # Shifted by +1 to include issue_time in hindcast
+                    hindcast_start = anchor_idx + self._forecast_offset - hindcast_history + 1
+                    hindcast_end = anchor_idx + self._forecast_offset + 1
+                    forecast_end = anchor_idx + self._forecast_offset + self._forecast_seq_len[freq_idx] + 1
+
+                    if hindcast_start < 0:
+                        continue
+                    if forecast_end > target_matrix.shape[0]:
+                        continue
+
+                    if self.is_train:
+                        hindcast_window = hindcast_matrix[hindcast_start:hindcast_end]
+                        if np.any(np.isnan(hindcast_window)):
+                            continue
+
+                        forecast_window = fc_tensor[candidate_idx, :self._forecast_seq_len[freq_idx]]
+                        if np.any(np.isnan(forecast_window)):
+                            continue
+
+                        target_window = target_matrix[hindcast_start:forecast_end]
+                        predict_last_n = self._predict_last_n[freq_idx]
+                        if predict_last_n > 0:
+                            tail = target_window[-predict_last_n:]
+                            if tail.size > 0 and np.all(np.isnan(tail)):
+                                continue
+
+                    validity[candidate_idx] = True
 
                 validity_masks.append(validity)
 
