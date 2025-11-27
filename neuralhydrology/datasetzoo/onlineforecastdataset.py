@@ -884,11 +884,19 @@ class OnlineForecastDataset(GenericDataset):
             # lead-time in each issue can be NaN after interpolation; fill forward to retain samples.
             if 'lead_time' in fc_inputs.dims:
                 fc_inputs = fc_inputs.bfill(dim='lead_time')
-            fc_tensor_da = fc_inputs.to_array('variable')
-            if 'lead_time' in fc_tensor_da.dims:
-                fc_tensor = fc_tensor_da.transpose(issue_dim, 'lead_time', 'variable').values.astype(np.float32)
-            else:
-                fc_tensor = fc_tensor_da.transpose(issue_dim, 'variable').values.astype(np.float32)[:, np.newaxis, :]
+            
+            # Manual stacking to avoid xarray.to_array() reshaping errors and ensure correct feature order
+            fc_tensor_list = []
+            for var in available_forecast:
+                da = fc_inputs[var]
+                if 'lead_time' in da.dims:
+                    da = da.transpose(issue_dim, 'lead_time')
+                    fc_tensor_list.append(da.values)
+                else:
+                    da = da.transpose(issue_dim)
+                    fc_tensor_list.append(da.values[:, np.newaxis])
+            
+            fc_tensor = np.stack(fc_tensor_list, axis=-1).astype(np.float32)
 
             if fc_tensor.shape[1] < max(self._forecast_seq_len):
                 LOGGER.warning("Forecast tensor shorter than forecast_seq_length for basin %s - skipping.", basin)
