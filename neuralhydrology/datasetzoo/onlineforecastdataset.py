@@ -186,15 +186,6 @@ class OnlineForecastDataset(GenericDataset):
             self._validate_data_availability(self.cfg)
             return cached_dataset
 
-        if train_data_file is not None and Path(train_data_file).exists():
-            dataset = self._load_pickled_dataset(Path(train_data_file))
-            if not self.frequencies:
-                native_frequency = utils.infer_frequency(dataset["time"].values)
-                self.frequencies = [native_frequency]
-            self._update_data_availability(merged_ds=dataset)
-            self._validate_data_availability(self.cfg)
-            return dataset
-
         dataset = self._build_dataset_from_sources()
         if self.is_train and self.cfg.save_train_data:
             self._save_dataset_cache(dataset)
@@ -395,17 +386,15 @@ class OnlineForecastDataset(GenericDataset):
         dataset.chunk({'basin': max(1, len(self.basins))}).to_zarr(store=cache_path, mode='w')
 
     def _cache_candidates(self, train_data_file: Optional[Path]) -> List[Path]:
+        candidates = []
+        if train_data_file is not None:
+            candidates.append(Path(train_data_file))
+
         train_dir = getattr(self.cfg, 'train_dir', None)
-        if train_dir is None:
-            return []
+        if train_dir is not None:
+            candidates.append(Path(train_dir) / 'train_data.zarr')
 
-        train_dir_path = Path(train_dir)
-        return [train_dir_path / 'train_data.zarr']
-
-    def _load_pickled_dataset(self, train_data_file: Path) -> xr.Dataset:
-        with train_data_file.open("rb") as fp:
-            dataset_dict = pickle.load(fp)
-        return xr.Dataset.from_dict(dataset_dict)
+        return candidates
 
     def _ensure_scaler(self,
                        period: str,
@@ -559,9 +548,6 @@ class OnlineForecastDataset(GenericDataset):
             )
             
             LOGGER.info("Loading forecast data using operational pipeline...")
-            
-            # Check if any of the configured time periods fall before NOAA GEFS archive availability
-            self._validate_forecast_archive_availability()
             
             # Load basin centroids (similar to operational notebook)
             basin_centroids_file = self.cfg.data_dir / "basin_centroids" / "basin_centroids.csv"
@@ -825,8 +811,24 @@ class OnlineForecastDataset(GenericDataset):
 
         for basin in tqdm(basin_coordinates, file=sys.stdout, disable=self._disable_pbar):
             basin_hcst = xr_hcst.sel(basin=basin, drop=True)
-            # Load forecast data for this basin into memory immediately to avoid Zarr/Dask indexing issues
-            basin_fcst = xr_fcst.sel(basin=basin, drop=True).load()
+            
+            # Optimization: Determine time range for this basin and period to slice BEFORE loading
+            # This prevents loading the entire history into RAM when we only need a small slice (e.g. test period)
+            start_dates = self.start_and_end_dates.get(basin, {}).get('start_dates', [])
+            end_dates = self.start_and_end_dates.get(basin, {}).get('end_dates', [])
+            
+            basin_fcst = xr_fcst.sel(basin=basin, drop=True)
+            
+            if start_dates and end_dates:
+                # Convert to timestamps and find global min/max for this basin
+                min_time = pd.to_datetime(min(start_dates))
+                max_time = pd.to_datetime(max(end_dates)) + pd.Timedelta(days=1) # Add buffer for end of day
+                
+                # Slice the Zarr array lazily
+                basin_fcst = basin_fcst.sel({issue_dim: slice(min_time, max_time)})
+            
+            # Now load the (potentially much smaller) slice into memory
+            basin_fcst = basin_fcst.load()
 
             if time_dim not in basin_hcst.dims:
                 LOGGER.warning("Time dimension not found for basin %s - skipping.", basin)
@@ -1154,60 +1156,7 @@ class OnlineForecastDataset(GenericDataset):
             
             raise ValueError(error_msg)
         
-        LOGGER.info("✅ Data availability validation passed - all periods fall within available data ranges")
+        LOGGER.info("✅ Data availability validation passed")
 
-    def _validate_forecast_archive_availability(self):
-        """Validate that training, validation, and test periods don't extend before NOAA GEFS archive availability.
-        
-        The NOAA GEFS forecast archive is only available from 2000-01-01T00:00:00 onwards.
-        This method checks all configured time periods and raises an error if any period
-        starts before this date.
-        
-        Raises
-        ------
-        ValueError
-            If any time period starts before 2000-01-01
-        """
-        # NOAA GEFS forecast archive availability starts from this date
-        archive_start_date = pd.to_datetime('2000-01-01')
-        
-        # Get all configured time periods
-        time_periods = []
-        
-        # Check training period
-        if hasattr(self.cfg, 'train_start_date') and self.cfg.train_start_date:
-            train_start = pd.to_datetime(self.cfg.train_start_date)
-            time_periods.append(('training', train_start))
-        
-        # Check validation period
-        if hasattr(self.cfg, 'validation_start_date') and self.cfg.validation_start_date:
-            validation_start = pd.to_datetime(self.cfg.validation_start_date)
-            time_periods.append(('validation', validation_start))
-        
-        # Check test period
-        if hasattr(self.cfg, 'test_start_date') and self.cfg.test_start_date:
-            test_start = pd.to_datetime(self.cfg.test_start_date)
-            time_periods.append(('test', test_start))
-        
-        # Check each period
-        invalid_periods = []
-        for period_name, period_start in time_periods:
-            if period_start < archive_start_date:
-                invalid_periods.append((period_name, period_start))
-        
-        if invalid_periods:
-            error_msg = (
-                f"NOAA GEFS forecast archive is only available from {archive_start_date.strftime('%Y-%m-%d')} onwards. "
-                f"The following time periods extend before this date and cannot be used:\n"
-            )
-            for period_name, period_start in invalid_periods:
-                error_msg += f"  - {period_name} period starts at {period_start.strftime('%Y-%m-%d')}\n"
-            
-            error_msg += (
-                f"\nPlease adjust your configuration to use dates from {archive_start_date.strftime('%Y-%m-%d')} onwards "
-                f"or disable forecast data loading for earlier periods."
-            )
-            
-            LOGGER.error(error_msg)
-            raise ValueError(error_msg)
+
 
