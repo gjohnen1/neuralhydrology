@@ -825,7 +825,8 @@ class OnlineForecastDataset(GenericDataset):
 
         for basin in tqdm(basin_coordinates, file=sys.stdout, disable=self._disable_pbar):
             basin_hcst = xr_hcst.sel(basin=basin, drop=True)
-            basin_fcst = xr_fcst.sel(basin=basin, drop=True)
+            # Load forecast data for this basin into memory immediately to avoid Zarr/Dask indexing issues
+            basin_fcst = xr_fcst.sel(basin=basin, drop=True).load()
 
             if time_dim not in basin_hcst.dims:
                 LOGGER.warning("Time dimension not found for basin %s - skipping.", basin)
@@ -850,9 +851,6 @@ class OnlineForecastDataset(GenericDataset):
                 continue
 
             basin_fcst = basin_fcst.sel({issue_dim: filtered_issue_times})
-
-            # Explicitly load into memory to avoid dask/to_dataframe issues and get better error messages
-            basin_fcst = basin_fcst.load()
 
             forecast_df = basin_fcst.to_dataframe().reset_index().set_index([issue_dim, 'lead_time']).sort_index()
             if forecast_df.empty:
