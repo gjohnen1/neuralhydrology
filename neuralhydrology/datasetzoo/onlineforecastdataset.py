@@ -603,8 +603,9 @@ class OnlineForecastDataset(GenericDataset):
             # Compute forecast quartiles as separate variables (adds _q25, _q50, _q75 suffixes)
             basin_forecasts_quartiles = self._compute_forecast_quartiles_as_variables(basin_forecasts)
             
-            # Interpolate to hourly for first 240 hours (10 days)
-            basin_forecasts_hourly = interpolate_to_hourly(basin_forecasts_quartiles, max_hours=240)
+            # Interpolate to hourly. Use the configured forecast sequence length.
+            max_hours = max(self._forecast_seq_len)
+            basin_forecasts_hourly = interpolate_to_hourly(basin_forecasts_quartiles, max_hours=max_hours)
             
             # Final filter to exactly match config (in case interpolation changed variable names)
             forecast_vars = [var for var in basin_forecasts_hourly.data_vars if var in self.cfg.forecast_inputs]
@@ -898,8 +899,9 @@ class OnlineForecastDataset(GenericDataset):
             
             fc_tensor = np.stack(fc_tensor_list, axis=-1).astype(np.float32)
 
-            if fc_tensor.shape[1] < max(self._forecast_seq_len):
-                LOGGER.warning("Forecast tensor shorter than forecast_seq_length for basin %s - skipping.", basin)
+            required_len = max(self._forecast_seq_len)
+            if fc_tensor.shape[1] < required_len:
+                LOGGER.warning(f"Forecast tensor length ({fc_tensor.shape[1]}) is shorter than required forecast_seq_length ({required_len}) for basin {basin} - skipping.")
                 basins_without_samples.append(basin)
                 continue
 
