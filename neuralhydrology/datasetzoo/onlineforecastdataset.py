@@ -752,8 +752,12 @@ class OnlineForecastDataset(GenericDataset):
             hindcast_end_idx = hindcast_idx + self._forecast_offset + 1
             global_end_idx = hindcast_idx + self._forecast_offset + forecast_seq_len + 1
 
-            sample[f'x_h{freq_suffix}'] = self._x_h[basin][freq][hindcast_start_idx:hindcast_end_idx]
-            sample[f'x_f{freq_suffix}'] = self._x_f[basin][freq][forecast_idx]
+            # Load from mmap (numpy) and convert to tensor
+            x_h = self._x_h[basin][freq][hindcast_start_idx:hindcast_end_idx]
+            sample[f'x_h{freq_suffix}'] = torch.from_numpy(x_h)
+            
+            x_f = self._x_f[basin][freq][forecast_idx]
+            sample[f'x_f{freq_suffix}'] = torch.from_numpy(x_f)
             
             # Create dictionaries for InputLayer compatibility
             # InputLayer expects x_d_hindcast and x_d_forecast as dictionaries of tensors (seq_len, 1)
@@ -766,7 +770,9 @@ class OnlineForecastDataset(GenericDataset):
                 for i, k in enumerate(self.cfg.forecast_inputs)
             }
 
-            sample[f'y{freq_suffix}'] = self._y[basin][freq][hindcast_start_idx:global_end_idx]
+            y = self._y[basin][freq][hindcast_start_idx:global_end_idx]
+            sample[f'y{freq_suffix}'] = torch.from_numpy(y)
+            
             sample[f'date{freq_suffix}'] = self._dates[basin][freq][hindcast_start_idx:global_end_idx]
             if issue_time is not None:
                 sample[f'date_issue{freq_suffix}'] = issue_time
@@ -971,9 +977,23 @@ class OnlineForecastDataset(GenericDataset):
                 continue
 
             for freq in self.frequencies:
-                self._x_h[basin][freq] = torch.from_numpy(hindcast_matrix)
-                self._x_f[basin][freq] = torch.from_numpy(fc_tensor)
-                self._y[basin][freq] = torch.from_numpy(target_matrix)
+                # Define cache paths
+                cache_dir = self.cfg.train_dir / "binary_cache"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                
+                h_file = cache_dir / f"{basin}_{freq}_{self.period}_x_h.npy"
+                f_file = cache_dir / f"{basin}_{freq}_{self.period}_x_f.npy"
+                y_file = cache_dir / f"{basin}_{freq}_{self.period}_y.npy"
+                
+                # Save and memmap
+                np.save(h_file, hindcast_matrix)
+                np.save(f_file, fc_tensor)
+                np.save(y_file, target_matrix)
+                
+                self._x_h[basin][freq] = np.load(h_file, mmap_mode='r')
+                self._x_f[basin][freq] = np.load(f_file, mmap_mode='r')
+                self._y[basin][freq] = np.load(y_file, mmap_mode='r')
+                
                 self._dates[basin][freq] = date_values
                 self._issue_times[basin][freq] = issue_time_values
 
