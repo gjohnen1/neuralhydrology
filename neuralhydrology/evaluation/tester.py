@@ -129,7 +129,10 @@ class BaseTester(object):
     def _get_weight_file(self, epoch: int):
         """Get file path to weight file"""
         if epoch is None:
-            weight_file = sorted(list(self.run_dir.glob('model_epoch*.pt')))[-1]
+            if (self.run_dir / "model_best.pt").exists():
+                weight_file = self.run_dir / "model_best.pt"
+            else:
+                weight_file = sorted(list(self.run_dir.glob('model_epoch*.pt')))[-1]
         else:
             weight_file = self.run_dir / f"model_epoch{str(epoch).zfill(3)}.pt"
 
