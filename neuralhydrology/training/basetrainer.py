@@ -19,6 +19,7 @@ from neuralhydrology.evaluation import get_tester
 from neuralhydrology.evaluation.tester import BaseTester
 from neuralhydrology.modelzoo import get_model
 from neuralhydrology.training import get_loss_obj, get_optimizer, get_regularization_obj
+from neuralhydrology.training.early_stopping import EarlyStopping
 from neuralhydrology.training.logger import Logger
 from neuralhydrology.utils.config import Config
 from neuralhydrology.utils.logging_utils import setup_logging
@@ -199,6 +200,12 @@ class BaseTrainer(object):
             self._target_std = torch.from_numpy(
                 ds.scaler["xarray_feature_scale"][self.cfg.target_variables].to_array().values).to(self.device)
 
+        self.early_stopping = None
+        if self.cfg.early_stopping_patience is not None:
+            self.early_stopping = EarlyStopping(patience=self.cfg.early_stopping_patience,
+                                                min_delta=self.cfg.early_stopping_min_delta or 0.0,
+                                                mode=self.cfg.early_stopping_mode or 'min')
+
     def train_and_validate(self):
         """Train and validate the model.
 
@@ -234,6 +241,19 @@ class BaseTrainer(object):
                     print_msg += ", ".join(f"{k}: {v:.5f}" for k, v in valid_metrics.items() if k != 'avg_total_loss')
                     LOGGER.info(print_msg)
 
+                if self.early_stopping is not None:
+                    # Use validation loss for early stopping
+                    val_loss = valid_metrics['avg_total_loss']
+                    stop = self.early_stopping(val_loss, epoch)
+
+                    if self.early_stopping.best_epoch == epoch:
+                        LOGGER.info(f"New best model at epoch {epoch}. Saving model_best.pt")
+                        self._save_weights_and_optimizer(epoch, is_best=True)
+
+                    if stop:
+                        LOGGER.info(f"Early stopping triggered at epoch {epoch}")
+                        break
+
         # make sure to close tensorboard to avoid losing the last epoch
         if self.cfg.log_tensorboard:
             self.experiment_logger.stop_tb()
@@ -263,12 +283,16 @@ class BaseTrainer(object):
         self.model.load_state_dict(torch.load(weight_path, map_location=self.device))
         self.optimizer.load_state_dict(torch.load(str(optimizer_path), map_location=self.device))
 
-    def _save_weights_and_optimizer(self, epoch: int):
+    def _save_weights_and_optimizer(self, epoch: int, is_best: bool = False):
         weight_path = self.cfg.run_dir / f"model_epoch{epoch:03d}.pt"
         torch.save(self.model.state_dict(), str(weight_path))
 
         optimizer_path = self.cfg.run_dir / f"optimizer_state_epoch{epoch:03d}.pt"
         torch.save(self.optimizer.state_dict(), str(optimizer_path))
+
+        if is_best:
+            best_weight_path = self.cfg.run_dir / "model_best.pt"
+            torch.save(self.model.state_dict(), str(best_weight_path))
 
     def _train_epoch(self, epoch: int):
         self.model.train()
