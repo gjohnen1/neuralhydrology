@@ -359,6 +359,23 @@ class OnlineForecastDataset(GenericDataset):
                 else:
                     cache_path.unlink()
                 continue
+
+            # Check if all requested basins are present in the cache
+            cached_basins = set(dataset['basin'].values)
+            requested_basins = set(self.basins)
+            missing_basins = requested_basins - cached_basins
+            
+            if missing_basins:
+                LOGGER.info("Cached dataset is missing basins: %s. Rebuilding cache.", missing_basins)
+                try:
+                    dataset.close()
+                except AttributeError:
+                    pass
+                # We do not delete the cache here immediately, as we might want to implement
+                # partial updates in the future. For now, we just skip this cache candidate
+                # which triggers a rebuild in _load_or_create_xarray_dataset.
+                continue
+
             if not self.frequencies:
                 native_frequency = utils.infer_frequency(dataset["time"].values)
                 self.frequencies = [native_frequency]
@@ -383,6 +400,11 @@ class OnlineForecastDataset(GenericDataset):
         if dataset.attrs.get('onlineforecast_cache_version') != self.CACHE_VERSION:
             dataset.attrs['onlineforecast_cache_version'] = self.CACHE_VERSION
             dataset.attrs.update(self._availability.to_attrs())
+
+        # Ensure basin coordinate is cast to string to avoid object dtype and potential vlen-utf8 warnings
+        if 'basin' in dataset.coords:
+            dataset['basin'] = dataset['basin'].astype(str)
+
         dataset.chunk({'basin': max(1, len(self.basins))}).to_zarr(store=cache_path, mode='w')
 
     def _cache_candidates(self, train_data_file: Optional[Path]) -> List[Path]:
@@ -807,7 +829,16 @@ class OnlineForecastDataset(GenericDataset):
         issue_dim = 'issue_time' if 'issue_time' in xr_fcst.dims else ('time' if 'time' in xr_fcst.dims else 'date')
 
         basins_without_samples: List[str] = []
-        basin_coordinates = xr_hcst['basin'].values.tolist()
+        
+        # Filter basin_coordinates to only include basins requested in self.basins
+        # This ensures we only process and train on the basins specified in the config/basins.txt
+        # even if the cache contains more basins.
+        available_basins = set(xr_hcst['basin'].values.tolist())
+        requested_basins = set(self.basins)
+        basin_coordinates = list(available_basins.intersection(requested_basins))
+        
+        if not basin_coordinates:
+             raise ValueError(f"None of the requested basins {self.basins} found in the dataset.")
 
         for basin in tqdm(basin_coordinates, file=sys.stdout, disable=self._disable_pbar):
             basin_hcst = xr_hcst.sel(basin=basin, drop=True)
