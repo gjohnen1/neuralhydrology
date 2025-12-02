@@ -928,6 +928,18 @@ class Config(object):
     def time_series_data_sub_dir(self) -> str:
         return self._cfg.get("time_series_data_sub_dir", "")
 
+    @property
+    def early_stopping_patience(self) -> Optional[int]:
+        return self._cfg.get("early_stopping_patience", None)
+
+    @property
+    def early_stopping_min_delta(self) -> Optional[float]:
+        return self._cfg.get("early_stopping_min_delta", None)
+
+    @property
+    def early_stopping_mode(self) -> Optional[str]:
+        return self._cfg.get("early_stopping_mode", None)
+
     def _get_embedding_spec(self, embedding_spec: dict) -> dict:
         if isinstance(embedding_spec, bool) and embedding_spec:  #
             msg = [
