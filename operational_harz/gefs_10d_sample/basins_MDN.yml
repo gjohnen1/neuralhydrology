@@ -34,7 +34,7 @@ device: cuda:0
 # --- Validation configuration ---------------------------------------------------------------------
 
 # specify after how many epochs to perform validation
-validate_every: 1
+validate_every: 4
 
 # specify how many random basins to use for validation
 validate_n_random_basins: 4
@@ -89,10 +89,10 @@ negative_sample_handling: clip
 dynamics_embedding:
   type: fc
   # define number of neurons per layer in the FC network used as embedding network
-  hiddens:
-    - 30
-    - 20
-    - 64
+  hiddens: 64
+    # - 30
+    # - 20
+    # - 64
   # activation function of embedding network
   activation: tanh
   # dropout applied to embedding network
@@ -166,14 +166,14 @@ regularization:
 # specify learning rates to use starting at specific epochs (0 is the initial learning rate)
 learning_rate:
     0: 1e-3
-    30: 5e-4
-    40: 1e-4
+    40: 5e-4
+    60: 1e-4
 
 # Mini-batch size
 batch_size: 256
 
 # Number of training epochs
-epochs: 50
+epochs: 80
 
 # adds noise with given std to the labels during training. Leave empty or set to 0 if not used.
 target_noise_std: 0.005
@@ -209,7 +209,7 @@ forecast_seq_length: 240
 forecast_offset: 0
 
 # Number of parallel workers used in the data pipeline
-num_workers: 16
+num_workers: 0
 
 # Log the training loss every n steps
 log_interval: 5
@@ -327,7 +327,7 @@ hindcast_inputs:
 state_handoff_network:
   type: fc
   # define number of neurons per layer in the FC network used as embedding network
-  hiddens: 128
+  hiddens: 64
     # - 30
     # - 20
     # - 64
