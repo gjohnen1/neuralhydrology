@@ -155,6 +155,34 @@ class OnlineForecastDataset(GenericDataset):
                          id_to_int=id_to_int,
                          scaler=scaler)
 
+    def _load_attributes(self) -> pd.DataFrame:
+        """Load catchment attributes from *_attributes.csv files in data_dir."""
+        attributes_path = self.cfg.data_dir
+
+        if not attributes_path.exists():
+            raise FileNotFoundError(f"Attribute folder not found at {attributes_path}")
+
+        txt_files = list(attributes_path.glob('*_attributes.csv'))
+        
+        if not txt_files:
+             return pd.DataFrame()
+
+        # Read-in attributes into one big dataframe
+        dfs = []
+        for txt_file in txt_files:
+            df_temp = pd.read_csv(txt_file, sep=',', header=0, dtype={'gauge_id': str})
+            df_temp = df_temp.set_index('gauge_id')
+            dfs.append(df_temp)
+
+        df = pd.concat(dfs, axis=1)
+
+        if self.basins:
+            if any(b not in df.index for b in self.basins):
+                raise ValueError('Some basins are missing static attributes.')
+            df = df.loc[self.basins]
+
+        return df
+
     def _initialize_frequency_configuration(self):
         """Checks and extracts configuration values for 'use_frequency', 'seq_length', and 'predict_last_n'"""
 
