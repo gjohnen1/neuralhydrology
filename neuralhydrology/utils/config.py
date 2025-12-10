@@ -261,6 +261,26 @@ class Config(object):
         return cfg
 
     @property
+    def early_stopping_min_delta(self) -> Optional[float]:
+        return self._cfg.get("early_stopping_min_delta", None)
+
+    @property
+    def early_stopping_mode(self) -> Optional[str]:
+        return self._cfg.get("early_stopping_mode", None)
+
+    @property
+    def early_stopping_patience(self) -> Optional[int]:
+        return self._cfg.get("early_stopping_patience", None)
+
+    @property 
+    def forecast_offset(self) -> int: 
+        return self._cfg.get("forecast_offset", 0)
+    
+    @property
+    def time_series_data_sub_dir(self) -> str:
+        return self._cfg.get("time_series_data_sub_dir", "")
+
+    @property
     def additional_feature_files(self) -> List[Path]:
         return self._as_default_list(self._cfg.get("additional_feature_files", None))
 
