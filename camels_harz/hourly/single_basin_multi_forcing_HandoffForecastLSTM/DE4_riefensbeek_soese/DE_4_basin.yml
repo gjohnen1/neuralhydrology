@@ -1,0 +1,169 @@
+# --- Experiment configurations ---------------------------------------------------------------------
+
+# experiment name, used as folder name
+experiment_name: hourlyhandoffforecastlstm_seed32
+
+# files to specify training, validation and test basins (relative to code root or absolute path)
+train_basin_file: basin.txt
+validation_basin_file: basin.txt
+test_basin_file: basin.txt
+
+# training, validation and test time periods (format = 'dd/mm/yyyy')
+train_start_date: "01/01/2000"
+train_end_date: "30/09/2019"
+validation_start_date: "01/10/2020"
+validation_end_date: "30/09/2022"
+test_start_date: "01/10/2022"
+test_end_date: "31/12/2023"
+
+# fixed seed, leave empty to use a random seed
+seed: 32
+
+# which GPU (id) to use [in format of cuda:0, cuda:1 etc, or cpu or None]
+device: cuda:0
+
+# --- Validation configuration -----------------------------------------------------------------------
+
+# specify after how many epochs to perform validation
+validate_every: 0
+
+# specify how many random basins to use for validation
+validate_n_random_basins: 0
+
+# specify which metrics to calculate during validation (see neuralhydrology.evaluation.metrics)
+# this can either be a list or a dictionary. If a dictionary is used, the inner keys must match the name of the
+# target_variable specified below. Using dicts allows for different metrics per target variable.
+metrics:
+  - NSE
+  - KGE
+  - Alpha-NSE
+  - Beta-NSE
+
+# save_validation_results: if True, stores the validation results to disk as a pickle file
+save_validation_results: false
+
+cache_validation_data: true
+
+# --- Model configuration ----------------------------------------------------------------------------
+
+# base model type [lstm, ealstm, cudalstm, embcudalstm, mtslstm]
+# (has to match the if statement in modelzoo/__init__.py)
+model: handoff_forecast_lstm
+
+# prediction head [regression]. Define the head specific parameters below
+head: cmal
+
+# --- Handoff Forecast Model settings ----------------------------------------------------------------
+state_handoff_network:
+  type: fc
+  hiddens: 128
+  activation: tanh
+  dropout: 0.0
+
+# --- CMAL settings ---------------------------------------------------------------------------------
+
+# number of components
+n_distributions: 3
+
+# sampling behaviour during inference
+n_samples: 5000
+
+# how to account for negative samples 
+negative_sample_handling: clip
+
+# --- General settings ------------------------------------------------------------------------------
+
+# Number of layers of the LSTM
+num_layers: 1
+
+# Number of cell states of the LSTM
+hidden_size: 256
+
+# Initial bias value of the forget gate
+initial_forget_bias: 3
+
+# The amount of relative noise of the output
+target_noise_std: 0.1
+
+# Dropout applied to the output of the LSTM
+output_dropout: 0.4 # 20% dropout in the linear output layer
+
+# --- Training configuration -----------------------------------------------------------------------
+
+# specify optimizer [Adam]
+optimizer: Adam
+
+# specify loss [MSE, NSE, RMSE]
+loss: CMALLoss
+
+# specify learning rates to use starting at specific epochs (0 is the initial learning rate)
+learning_rate:
+  0.0005
+
+# Mini-batch size
+batch_size: 256
+
+# Number of training epochs
+epochs: 50
+
+# If a value, clips the gradients during training to that norm.
+clip_gradient_norm: 1
+
+# Defines which time steps are used to calculate the loss. Can't be larger than seq_length.
+# If use_frequencies is used, this needs to be a dict mapping each frequency to a predict_last_n-value, else an int.
+predict_last_n: 96
+
+# Length of the input sequence
+# If use_frequencies is used, this needs to be a dict mapping each frequency to a seq_length, else an int.
+seq_length: 336
+
+# Length of the forecast sequence
+forecast_seq_length: 96
+
+# Number of time steps the forecast is shifted into the future
+forecast_overlap: 24
+
+# Number of parallel workers used in the data pipeline
+num_workers: 4
+
+# Log the training loss every n steps
+log_interval: 4
+
+# If true, writes logging results into tensorboard file
+log_tensorboard: True
+
+# If a value and greater than 0, logs n random basins as figures during validation
+log_n_figures: 1
+
+# Save model weights every n epochs
+save_weights_every: 1
+
+# --- Data configurations --------------------------------------------------------------------------
+
+# which data set to use [camels_us, camels_gb, global, hourly_camels_us]
+dataset: hourly_harz
+
+# Path to data set root
+data_dir: ../../../../data/harz
+
+dynamic_inputs:
+  - temperature_2m
+  - relative_humidity_2m
+  - dew_point_2m
+  - precipitation
+  - rain
+  - snowfall
+  - surface_pressure
+  - et0_fao_evapotranspiration
+  - wind_direction_10m
+  - soil_moisture_0_to_7cm
+  - soil_moisture_7_to_28cm
+  - soil_moisture_28_to_100cm
+  - shortwave_radiation
+
+# which columns to use as target
+target_variables:
+  - discharge_vol
+
+static_attributes:
+  []
