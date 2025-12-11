@@ -122,7 +122,7 @@ save_validation_results: True
 dataset: camels_de
 
 # Path to data set root
-data_dir: ../../../data/camels_de
+data_dir: ../../../../data/camels_de
 
 dynamic_inputs:
   - precipitation_mean
