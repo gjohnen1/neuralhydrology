@@ -1,7 +1,7 @@
 # --- Experiment configurations --------------------------------------------------------------------
 
 # experiment name, used as folder name
-experiment_name: development_run_sequential_forecast_lstm
+experiment_name: dev_run_sequential_forecast_lstm
 
 # place to store run directory (if empty runs are stored in code_dir/runs/)
 run_dir: 
@@ -204,7 +204,7 @@ predict_last_n: 240
 
 # Length of the input sequence
 # If use_frequencies is used, this needs to be a dict mapping each frequency to a seq_length, else an int.
-seq_length: 720 # 30 days
+seq_length: 1440 # 60 days
 
 # Length of the forecast sequence 
 forecast_seq_length: 240
