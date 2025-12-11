@@ -58,9 +58,6 @@ negative_sample_handling: clip # negative predictions in the original value spac
 
 # ----> General settings <----
 
-# Number of layers of the LSTM
-num_layers: 1
-
 # Number of cell states of the LSTM
 hidden_size: 256
 
