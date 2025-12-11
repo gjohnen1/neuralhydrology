@@ -47,8 +47,8 @@ The `OnlineForecastDataset` implements the following pipeline to prepare data fo
 *   It loads or initializes a feature scaler (standardization) based on the run mode (train/test).
 
 ### Step 2: Data Loading (or Cache Retrieval)
-*   **Caching:** The system first checks for a pre-computed Zarr cache (`train_data.zarr`). If found and valid, it loads data directly from the cache to speed up initialization.
-*   **Building from Sources:** If no cache exists, it triggers the build process:
+*   **Caching:** The system checks for a pre-computed Zarr cache for each basin (`data/zarr_cache/{basin}.zarr`). If found and valid, it loads data directly from the cache to speed up initialization.
+*   **Building from Sources:** If no cache exists for a basin, it triggers the build process:
     1.  **Historical Data:** Iterates through each basin, loads the corresponding CSV, filters for requested variables, and converts to an xarray Dataset.
     2.  **Forecast Data:**
         *   Loads basin centroids.
@@ -75,7 +75,7 @@ When a sample is requested:
 ## Data Formats & Structures
 
 ### Internal Xarray Structure
-The merged dataset (cached as `train_data.zarr`) has the following structure:
+The dataset (cached per basin as `data/zarr_cache/{basin}.zarr`) has the following structure:
 *   **Dimensions:** `basin`, `time` (historical), `issue_time` (forecast), `lead_time` (forecast).
 *   **Coordinates:** `basin` (string), `time` (datetime), `issue_time` (datetime).
 *   **Data Variables:**
