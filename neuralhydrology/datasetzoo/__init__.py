@@ -13,6 +13,7 @@ from neuralhydrology.datasetzoo.genericdataset import GenericDataset
 from neuralhydrology.datasetzoo.hourlycamelsus import HourlyCamelsUS
 from neuralhydrology.datasetzoo.lamah import LamaH
 from neuralhydrology.datasetzoo.onlineforecastdataset import OnlineForecastDataset
+from neuralhydrology.datasetzoo.onlineforecast_combined_dataset import CombinedForecastDataset
 from neuralhydrology.utils.config import Config
 from neuralhydrology.datasetzoo.datasetregistry import DatasetRegistry
 
@@ -114,4 +115,5 @@ _datasetZooRegistry.register_dataset_class("caravan", Caravan)
 _datasetZooRegistry.register_dataset_class("camels_ind", CamelsIND)
 _datasetZooRegistry.register_dataset_class("camels_de", CamelsDE)
 _datasetZooRegistry.register_dataset_class("online_forecast", OnlineForecastDataset)
+_datasetZooRegistry.register_dataset_class("combined_forecast", CombinedForecastDataset)
 
