@@ -21,4 +21,7 @@ docs/build/*
 # agent instructions
 **/*instructions.md
 
+# agent files
+.github/agents/
+
 
