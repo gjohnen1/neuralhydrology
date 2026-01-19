@@ -234,7 +234,7 @@ save_validation_results: False
 # --- Data configurations --------------------------------------------------------------------------
 
 # which data set to use [camels_us, camels_gb, global, hourly_camels_us, camels_cl, generic]
-dataset: online_forecast
+dataset: perfect_forecast
 
 # Path to data set root
 data_dir: ../../data/harz
@@ -267,21 +267,6 @@ train_data_file:
 # - tmin(C)
 # - vp(Pa)
 dynamic_inputs:
-  - maximum_temperature_2m_q25
-  - maximum_temperature_2m_q50
-  - maximum_temperature_2m_q75
-  - minimum_temperature_2m_q25
-  - minimum_temperature_2m_q50
-  - minimum_temperature_2m_q75
-  - precipitation_surface_q25
-  - precipitation_surface_q50
-  - precipitation_surface_q75
-  - relative_humidity_2m_q25
-  - relative_humidity_2m_q50
-  - relative_humidity_2m_q75
-  - temperature_2m_q25
-  - temperature_2m_q50
-  - temperature_2m_q75
   - temperature_2m
   - relative_humidity_2m
   - dew_point_2m
@@ -297,21 +282,20 @@ dynamic_inputs:
   - shortwave_radiation
 
 forecast_inputs:
-  - maximum_temperature_2m_q25
-  - maximum_temperature_2m_q50
-  - maximum_temperature_2m_q75
-  - minimum_temperature_2m_q25
-  - minimum_temperature_2m_q50
-  - minimum_temperature_2m_q75
-  - precipitation_surface_q25
-  - precipitation_surface_q50
-  - precipitation_surface_q75
-  - relative_humidity_2m_q25
-  - relative_humidity_2m_q50
-  - relative_humidity_2m_q75
-  - temperature_2m_q25
-  - temperature_2m_q50
-  - temperature_2m_q75
+  - temperature_2m_perfect  
+  - relative_humidity_2m_perfect
+  - dew_point_2m_perfect
+  - precipitation_perfect
+  - rain_perfect
+  - snowfall_perfect
+  - surface_pressure_perfect
+  - et0_fao_evapotranspiration_perfect
+  - wind_direction_10m_perfect
+  - soil_moisture_0_to_7cm_perfect
+  - soil_moisture_7_to_28cm_perfect
+  - soil_moisture_28_to_100cm_perfect
+  - shortwave_radiation_perfect
+
 
 hindcast_inputs:
   - temperature_2m

@@ -103,6 +103,9 @@ class PerfectForecastDataset(OnlineForecastDataset):
             # Strip quantile suffixes to find base variable
             base_var = var.replace('_q25', '').replace('_q50', '').replace('_q75', '')
             
+            # Strip _perfect suffix to find base variable if manual disambiguation is used
+            base_var = base_var.replace('_perfect', '')
+
             if base_var in historical_ds.data_vars:
                 var_mapping[var] = base_var
             elif var in historical_ds.data_vars:
