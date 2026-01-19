@@ -17,3 +17,8 @@ configs/*
 .ipynb_checkpoints/
 data/*
 docs/build/*
+
+# agent instructions
+**/*instructions.md
+
+
