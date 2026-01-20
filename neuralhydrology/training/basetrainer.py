@@ -22,7 +22,7 @@ from neuralhydrology.training import get_loss_obj, get_optimizer, get_regulariza
 from neuralhydrology.training.logger import Logger
 from neuralhydrology.utils.config import Config
 from neuralhydrology.utils.logging_utils import setup_logging
-from neuralhydrology.training.earlystopper import EarlyStopper
+from neuralhydrology.training.early_stopping import EarlyStopping
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,11 +53,15 @@ class BaseTrainer(object):
         self._disable_pbar = cfg.verbose == 0
         self._max_updates_per_epoch = cfg.max_updates_per_epoch
         self._early_stopping = cfg.early_stopping
-        self._patience_early_stopping = cfg.patience_early_stopping
+        if cfg.early_stopping_patience is not None:
+            self._patience_early_stopping = cfg.early_stopping_patience
+        else:
+            self._patience_early_stopping = cfg.patience_early_stopping
         self._minimum_epochs_before_early_stopping = cfg.minimum_epochs_before_early_stopping
         self._dynamic_learning_rate = cfg.dynamic_learning_rate
         self._patience_dynamic_learning_rate = cfg.patience_dynamic_learning_rate
         self._factor_dynamic_learning_rate = cfg.factor_dynamic_learning_rate
+        self._minimum_learning_rate = cfg.minimum_learning_rate
 
         # load train basin list and add number of basins to the config
         self.basins = load_basin_file(cfg.train_basin_file)
@@ -215,12 +219,12 @@ class BaseTrainer(object):
         if self._early_stopping:
             if self.cfg.is_continue_training:
                 LOGGER.warning("Early stopping state is reset.")   
-            early_stopper = EarlyStopper(patience = self._patience_early_stopping, min_delta = 0.0001)
+            early_stopper = EarlyStopping(patience=self._patience_early_stopping, min_delta=0.0001, mode='min')
 
         if self._dynamic_learning_rate:
             if self.cfg.is_continue_training:
                 LOGGER.warning("Scheduler state is reset.")
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=self._factor_dynamic_learning_rate, patience=self._patience_dynamic_learning_rate)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=self._factor_dynamic_learning_rate, patience=self._patience_dynamic_learning_rate, min_lr=self._minimum_learning_rate)
 
         for epoch in range(self._epoch + 1, self._epoch + self.cfg.epochs + 1):
             if not self._dynamic_learning_rate:
@@ -253,7 +257,7 @@ class BaseTrainer(object):
                     LOGGER.info(print_msg)
                 
 
-                if self._early_stopping and epoch > self._minimum_epochs_before_early_stopping and early_stopper.check_early_stopping(valid_metrics['avg_total_loss']):
+                if self._early_stopping and epoch > self._minimum_epochs_before_early_stopping and early_stopper(valid_metrics['avg_total_loss'], epoch):
                     LOGGER.info(f"Early stopping triggered at epoch {epoch} with validation loss {valid_metrics['avg_total_loss']:.5f}. Training stopped.")
                     break
                 if self._dynamic_learning_rate:

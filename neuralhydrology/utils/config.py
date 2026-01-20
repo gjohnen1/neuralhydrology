@@ -962,13 +962,13 @@ class Config(object):
     @property
     def dynamic_learning_rate(self) -> bool:
         """Whether to use  dynamic learning rate. Defaults to False if not set."""
-        early_stopping = self._cfg.get("early_stopping", False)
-        if early_stopping and self.validate_every != 1:
+        dynamic_learning_rate = self._cfg.get("dynamic_learning_rate", False)
+        if dynamic_learning_rate and self.validate_every != 1:
             raise ValueError(
-                "Early stopping can only be used if validation is performed every epoch (validate_every=1). "
-                "Set validate_every=1 in the config to use early stopping."
+                "Dynamic learning rate can only be used if validation is performed every epoch (validate_every=1). "
+                "Set validate_every=1 in the config to use dynamic learning rate."
             )
-        return early_stopping
+        return dynamic_learning_rate
     
     @property
     def patience_dynamic_learning_rate(self) -> int:
@@ -981,6 +981,13 @@ class Config(object):
         """Factor by which to reduce learning rate."""
         if self.dynamic_learning_rate:
             return self._get_value_verbose("factor_dynamic_learning_rate")
+
+    @property
+    def minimum_learning_rate(self) -> float:
+        """Minimum learning rate for dynamic learning rate scheduler."""
+        if self.dynamic_learning_rate:
+            return self._cfg.get("minimum_learning_rate", 1e-8)
+
     
     def _get_embedding_spec(self, embedding_spec: dict) -> dict:
         if isinstance(embedding_spec, bool) and embedding_spec:  #
