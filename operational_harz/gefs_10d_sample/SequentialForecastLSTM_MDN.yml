@@ -34,7 +34,7 @@ device: cuda:0
 # --- Validation configuration ---------------------------------------------------------------------
 
 # specify after how many epochs to perform validation
-validate_every: 4
+validate_every: 1
 
 # specify how many random basins to use for validation
 validate_n_random_basins: 4
@@ -177,7 +177,17 @@ batch_size: 256
 epochs: 100
 
 # Early stopping configuration
+early_stopping: True
 early_stopping_patience: 15
+early_stopping_min_delta: 0.0001
+early_stopping_mode: min
+minimum_epochs_before_early_stopping: 20
+save_best_model: True
+
+# Dynamic Learning Rate (Plateau Scheduler)
+dynamic_learning_rate: True
+patience_dynamic_learning_rate: 7
+factor_dynamic_learning_rate: 0.5
 
 # adds noise with given std to the labels during training. Leave empty or set to 0 if not used.
 target_noise_std: 0.005
