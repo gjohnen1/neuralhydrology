@@ -958,7 +958,12 @@ class Config(object):
         """Minimum number of epochs before early stopping can be triggered."""
         if self.early_stopping:
             return self._get_value_verbose("minimum_epochs_before_early_stopping")
-    
+
+    @property
+    def save_best_model(self) -> bool:
+        """Whether to save the best model during training. Defaults to True."""
+        return self._cfg.get("save_best_model", True)
+
     @property
     def dynamic_learning_rate(self) -> bool:
         """Whether to use  dynamic learning rate. Defaults to False if not set."""

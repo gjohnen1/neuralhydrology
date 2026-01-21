@@ -177,8 +177,12 @@ epochs: 100
 # Early stopping configuration
 early_stopping: True
 early_stopping_patience: 10
+early_stopping_min_delta: 0.0001  # Minimum improvement to qualify as progress
+early_stopping_mode: min          # 'min' for loss, 'max' for metrics like NSE
 # Reduced warmup slightly to allow the scheduler to kick in earlier if needed
 minimum_epochs_before_early_stopping: 20
+# Save best model checkpoint based on validation loss
+save_best_model: True
 
 # Dynamic Learning Rate (Plateau Scheduler)
 # Reduces LR when validation metric stops improving.

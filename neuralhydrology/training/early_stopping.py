@@ -71,7 +71,7 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 LOGGER.info(f"Early stopping triggered at epoch {epoch}. "
-                           f"No significant improvement since NSE: {self.best_value:.5f} at epoch {self.best_epoch}")
+                           f"No significant improvement since best value: {self.best_value:.5f} at epoch {self.best_epoch}")
                 return True
             else:
                 LOGGER.debug(f"No improvement for {self.counter}/{self.patience} epochs. "

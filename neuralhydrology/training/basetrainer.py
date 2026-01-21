@@ -58,6 +58,11 @@ class BaseTrainer(object):
         else:
             self._patience_early_stopping = cfg.patience_early_stopping
         self._minimum_epochs_before_early_stopping = cfg.minimum_epochs_before_early_stopping
+        self._early_stopping_min_delta = cfg.early_stopping_min_delta if cfg.early_stopping_min_delta is not None else 0.0001
+        self._early_stopping_mode = cfg.early_stopping_mode if cfg.early_stopping_mode is not None else 'min'
+        self._save_best_model = cfg.save_best_model
+        self._best_valid_loss = float('inf')
+        self._best_epoch = 0
         self._dynamic_learning_rate = cfg.dynamic_learning_rate
         self._patience_dynamic_learning_rate = cfg.patience_dynamic_learning_rate
         self._factor_dynamic_learning_rate = cfg.factor_dynamic_learning_rate
@@ -219,7 +224,11 @@ class BaseTrainer(object):
         if self._early_stopping:
             if self.cfg.is_continue_training:
                 LOGGER.warning("Early stopping state is reset.")   
-            early_stopper = EarlyStopping(patience=self._patience_early_stopping, min_delta=0.0001, mode='min')
+            early_stopper = EarlyStopping(
+                patience=self._patience_early_stopping,
+                min_delta=self._early_stopping_min_delta,
+                mode=self._early_stopping_mode
+            )
 
         if self._dynamic_learning_rate:
             if self.cfg.is_continue_training:
@@ -255,7 +264,12 @@ class BaseTrainer(object):
                     print_msg += f" -- Median validation metrics: "
                     print_msg += ", ".join(f"{k}: {v:.5f}" for k, v in valid_metrics.items() if k != 'avg_total_loss')
                     LOGGER.info(print_msg)
-                
+
+                # Save best model checkpoint if validation improved
+                if self._save_best_model and valid_metrics['avg_total_loss'] < self._best_valid_loss:
+                    self._best_valid_loss = valid_metrics['avg_total_loss']
+                    self._best_epoch = epoch
+                    self._save_best_model_checkpoint(epoch)
 
                 if self._early_stopping and epoch > self._minimum_epochs_before_early_stopping and early_stopper(valid_metrics['avg_total_loss'], epoch):
                     LOGGER.info(f"Early stopping triggered at epoch {epoch} with validation loss {valid_metrics['avg_total_loss']:.5f}. Training stopped.")
@@ -298,6 +312,16 @@ class BaseTrainer(object):
 
         optimizer_path = self.cfg.run_dir / f"optimizer_state_epoch{epoch:03d}.pt"
         torch.save(self.optimizer.state_dict(), str(optimizer_path))
+
+    def _save_best_model_checkpoint(self, epoch: int):
+        """Save the best model checkpoint."""
+        weight_path = self.cfg.run_dir / "model_best.pt"
+        torch.save(self.model.state_dict(), str(weight_path))
+
+        optimizer_path = self.cfg.run_dir / "optimizer_state_best.pt"
+        torch.save(self.optimizer.state_dict(), str(optimizer_path))
+
+        LOGGER.info(f"Saved best model checkpoint at epoch {epoch} with validation loss {self._best_valid_loss:.5f}")
 
     def _train_epoch(self, epoch: int):
         self.model.train()
