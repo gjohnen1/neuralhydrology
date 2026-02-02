@@ -15,8 +15,8 @@ test_basin_file: basins.txt
 train_start_date: "01/03/2021" # Forecast archive start
 train_end_date: "30/09/2023"
 validation_start_date: "01/10/2023"
-validation_end_date: "30/11/2023"
-test_start_date: "01/12/2023"
+validation_end_date: "14/01/2024"
+test_start_date: "15/01/2024"
 test_end_date: "30/04/2024" # Historic data end
 
 # if you want to use different (continuous or split) periods per basin (and period) define path to pickle files here.
@@ -72,7 +72,7 @@ negative_sample_handling: clip
 
 # ----> Embedding network settings <----
 
-# # define embedding network for static inputs
+# define embedding network for static inputs
 statics_embedding:
   type: fc
   # define number of neurons per layer in the FC network used as embedding network
@@ -82,22 +82,21 @@ statics_embedding:
     - 64
   # activation function of embedding network
   activation: tanh
-  # dropout applied to embedding network
-  dropout: 0.0
+  # dropout applied to embedding network (light regularization)
+  dropout: 0.1
 
 # define embedding network for dynamic inputs
 dynamics_embedding:
   type: fc
   # define number of neurons per layer in the FC network used as embedding network
+  # Deeper network for complex GEFS ensemble + ICON-D2 + hindcast inputs (34 variables)
   hiddens:
+    - 128
     - 64
-    # - 30
-    # - 20
-    # - 64
   # activation function of embedding network
   activation: tanh
-  # dropout applied to embedding network
-  dropout: 0.0
+  # dropout applied to embedding network (light regularization for many inputs)
+  dropout: 0.1
 
 # ----> MTSLSTM settings <----
 
@@ -165,9 +164,11 @@ regularization:
 #- tie_frequencies
 
 # specify learning rates to use starting at specific epochs (0 is the initial learning rate)
+# Smoother schedule with intermediate step at epoch 50
 learning_rate:
     0: 1e-3
     40: 5e-4
+    50: 2.5e-4
     60: 1e-4
 
 # Mini-batch size
@@ -176,17 +177,17 @@ batch_size: 256
 # Number of training epochs
 epochs: 100
 
-# Early stopping configuration
+# Early stopping configuration (more aggressive based on perfect forecast results)
 early_stopping: True
-early_stopping_patience: 15
+early_stopping_patience: 10
 early_stopping_min_delta: 0.0001
 early_stopping_mode: min
-minimum_epochs_before_early_stopping: 20
+minimum_epochs_before_early_stopping: 15
 save_best_model: True
 
-# Dynamic Learning Rate (Plateau Scheduler)
+# Dynamic Learning Rate (Plateau Scheduler) - more responsive to plateaus
 dynamic_learning_rate: True
-patience_dynamic_learning_rate: 7
+patience_dynamic_learning_rate: 5
 factor_dynamic_learning_rate: 0.5
 
 # adds noise with given std to the labels during training. Leave empty or set to 0 if not used.
