@@ -48,7 +48,9 @@ class SequentialForecastLSTM(BaseModel):
 
         self.lstm = nn.LSTM(
             input_size=self.forecast_embedding_net.output_size,
-            hidden_size=cfg.hidden_size
+            hidden_size=cfg.hidden_size,
+            num_layers=cfg.num_lstm_layers,
+            dropout=cfg.output_dropout if cfg.num_lstm_layers > 1 else 0.0,
         )
 
         self.dropout = nn.Dropout(p=cfg.output_dropout)
@@ -60,7 +62,10 @@ class SequentialForecastLSTM(BaseModel):
     def _reset_parameters(self):
         """Special initialization of certain model weights."""
         if self.cfg.initial_forget_bias is not None:
-            self.lstm.bias_hh_l0.data[self.cfg.hidden_size:2 * self.cfg.hidden_size] = self.cfg.initial_forget_bias
+            num_layers = self.cfg.num_lstm_layers
+            for layer in range(num_layers):
+                bias = getattr(self.lstm, f'bias_hh_l{layer}')
+                bias.data[self.cfg.hidden_size:2 * self.cfg.hidden_size] = self.cfg.initial_forget_bias
 
     def forward(self, data: dict[str, torch.Tensor | dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """Perform a forward pass on the SequentialForecastLSTM model.
