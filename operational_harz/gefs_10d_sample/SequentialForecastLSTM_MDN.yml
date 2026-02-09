@@ -165,10 +165,9 @@ regularization:
 #- tie_frequencies
 
 # specify learning rates to use starting at specific epochs (0 is the initial learning rate)
+# Tuned: higher initial LR, let dynamic scheduler handle decay
 learning_rate:
-    0: 1e-3
-    40: 5e-4
-    60: 1e-4
+    0: 2e-3
 
 # Mini-batch size
 batch_size: 256
@@ -176,18 +175,18 @@ batch_size: 256
 # Number of training epochs
 epochs: 100
 
-# Early stopping configuration
+# Early stopping configuration (tuned: more patience for convergence)
 early_stopping: True
 early_stopping_patience: 15
 early_stopping_min_delta: 0.0001
 early_stopping_mode: min
-minimum_epochs_before_early_stopping: 20
+minimum_epochs_before_early_stopping: 25
 save_best_model: True
 
-# Dynamic Learning Rate (Plateau Scheduler)
+# Dynamic Learning Rate (Plateau Scheduler) - tuned: slower decay, more patience
 dynamic_learning_rate: True
-patience_dynamic_learning_rate: 7
-factor_dynamic_learning_rate: 0.5
+patience_dynamic_learning_rate: 8
+factor_dynamic_learning_rate: 0.7
 
 # adds noise with given std to the labels during training. Leave empty or set to 0 if not used.
 target_noise_std: 0.005
