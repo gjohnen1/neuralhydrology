@@ -504,6 +504,10 @@ class Config(object):
         return self._cfg.get("hindcast_hidden_size", self.hidden_size)
 
     @property
+    def num_lstm_layers(self) -> int:
+        return self._cfg.get("num_lstm_layers", 1)
+
+    @property
     def hydroatlas_attributes(self) -> List[str]:
         return self._as_default_list(self._cfg.get("hydroatlas_attributes", []))
 
