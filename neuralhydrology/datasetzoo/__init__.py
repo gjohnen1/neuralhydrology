@@ -15,6 +15,7 @@ from neuralhydrology.datasetzoo.lamah import LamaH
 from neuralhydrology.datasetzoo.onlineforecastdataset import OnlineForecastDataset
 from neuralhydrology.datasetzoo.onlineforecast_combined_dataset import CombinedForecastDataset
 from neuralhydrology.datasetzoo.perfectforecastdataset import PerfectForecastDataset
+from neuralhydrology.datasetzoo.forecastdataset import ForecastDataset
 from neuralhydrology.utils.config import Config
 from neuralhydrology.datasetzoo.datasetregistry import DatasetRegistry
 
@@ -115,6 +116,12 @@ _datasetZooRegistry.register_dataset_class("lamah_c", LamaH)
 _datasetZooRegistry.register_dataset_class("caravan", Caravan)
 _datasetZooRegistry.register_dataset_class("camels_ind", CamelsIND)
 _datasetZooRegistry.register_dataset_class("camels_de", CamelsDE)
-_datasetZooRegistry.register_dataset_class("online_forecast", OnlineForecastDataset)
-_datasetZooRegistry.register_dataset_class("combined_forecast", CombinedForecastDataset)
-_datasetZooRegistry.register_dataset_class("perfect_forecast", PerfectForecastDataset)
+
+# New unified forecast dataset (recommended)
+_datasetZooRegistry.register_dataset_class("forecast", ForecastDataset)
+
+# Legacy forecast datasets (backward compatibility - still functional)
+# These work via auto-detection in ForecastDataset._detect_legacy_config()
+_datasetZooRegistry.register_dataset_class("online_forecast", ForecastDataset)
+_datasetZooRegistry.register_dataset_class("combined_forecast", ForecastDataset)
+_datasetZooRegistry.register_dataset_class("perfect_forecast", ForecastDataset)
