@@ -469,6 +469,16 @@ class Config(object):
         return self._as_default_dict(self._cfg.get("forecast_availability_masks", {}))
 
     @property
+    def forecast_input_gating(self) -> Dict[str, List[str]]:
+        """Mapping of mask feature names to lists of features that should be gated by that mask.
+
+        When configured, the dataset will element-wise multiply the listed features by the
+        mask value during preprocessing, so features from shorter-horizon forecast sources
+        are explicitly zeroed out when unavailable.
+        """
+        return self._as_default_dict(self._cfg.get("forecast_input_gating", {}))
+
+    @property
     def forcings(self) -> List[str]:
         return self._as_default_list(self._get_value_verbose("forcings"))
 
