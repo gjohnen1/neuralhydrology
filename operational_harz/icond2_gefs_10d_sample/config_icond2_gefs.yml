@@ -272,6 +272,22 @@ forecast_sources:
 forecast_availability_masks:
   icond2: true
 
+# Explicit input gating: multiply ICON-D2 features by the availability mask before
+# the embedding network, so padded lead times are cleanly zeroed out.
+forecast_input_gating:
+  icond2_available:
+    - precipitation_mean_icond2
+    - precipitation_mean_icond2_q25
+    - precipitation_mean_icond2_q50
+    - precipitation_mean_icond2_q75
+    - temperature_mean_icond2
+
+# Keep the availability mask in raw 0/1 form (skip z-score normalization)
+custom_normalization:
+  icond2_available:
+    centering: none
+    scaling: none
+
 # Path to data set root
 data_dir: ../../data/harz
 
