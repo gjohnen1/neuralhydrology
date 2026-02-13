@@ -1,5 +1,6 @@
 """GEFS forecast loader for NOAA Global Ensemble Forecast System data."""
 
+import importlib.util
 import time
 from typing import List, Optional
 
@@ -67,6 +68,7 @@ class GEFSLoader(ForecastLoader):
         self.max_hours = config.loader_kwargs.get('max_hours', self.DEFAULT_MAX_HOURS)
         self.retry_attempts = config.loader_kwargs.get('retry_attempts', self.DEFAULT_RETRY_ATTEMPTS)
         self.exponential_backoff = config.loader_kwargs.get('exponential_backoff', True)
+        self._zarr_available = importlib.util.find_spec("zarr") is not None
 
     def load(self, basins: List[str]) -> Optional[xr.Dataset]:
         """Load GEFS forecasts for specified basins.
@@ -91,6 +93,11 @@ class GEFSLoader(ForecastLoader):
             If all retry attempts to connect to NOAA fail.
         """
         self.logger.info(f"Loading GEFS forecasts for {len(basins)} basins...")
+        if not self._zarr_available:
+            raise ImportError(
+                "GEFS loader requires optional dependency 'zarr' to open NOAA GEFS stores. "
+                "Install zarr or use a non-GEFS forecast configuration in this environment."
+            )
 
         # Load basin centroids
         basin_centroids_file = self.cfg.data_dir / "basin_centroids" / "basin_centroids.csv"

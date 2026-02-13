@@ -37,7 +37,7 @@ class PerfectForecastLoader(ForecastLoader):
             variables:
               - temperature_2m
               - precipitation
-            quartiles: [0.5]  # Only median needed for deterministic perfect forecast
+            quartiles: []  # No quartiles needed for deterministic perfect forecast
             loader_kwargs:
               max_horizon: 240
     """

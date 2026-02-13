@@ -10,6 +10,7 @@ via config files, making it easy to add new forecast sources without code change
 """
 
 from functools import reduce
+import importlib.util
 from pathlib import Path
 import hashlib
 import logging
@@ -99,6 +100,11 @@ class ForecastDataset(GenericDataset):
         self._issue_times: Dict[str, Dict[str, np.ndarray]] = {}
         self._availability = DataAvailability()
         self.period_starts: Dict[str, pd.Timestamp] = {}
+        self._zarr_available = importlib.util.find_spec("zarr") is not None
+        if not self._zarr_available:
+            LOGGER.warning(
+                "Package 'zarr' is not available. Unified/legacy zarr cache read/write is disabled for this run."
+            )
 
         # Forecast-specific parameters (must be set before super().__init__ triggers _load_data)
         forecast_seq = cfg.forecast_seq_length
@@ -259,7 +265,7 @@ class ForecastDataset(GenericDataset):
                 type='perfect_forecast',
                 suffix='_perfect' if any('_perfect' in v for v in cfg.forecast_inputs) else '',
                 variables=variables,
-                quartiles=[0.5],  # Only median for perfect forecasts
+                quartiles=[],  # No quartiles for perfect forecasts (deterministic)
                 enabled=True,
                 loader_kwargs={'max_horizon': max(cfg.forecast_seq_length) if isinstance(cfg.forecast_seq_length, list) else cfg.forecast_seq_length}
             )]
@@ -395,6 +401,27 @@ class ForecastDataset(GenericDataset):
             path = self.cfg.data_dir / "zarr_cache" / f"{basin}_combined.zarr"
         elif self.cfg.dataset == 'perfect_forecast':
             path = self.cfg.data_dir / "zarr_cache_perfect" / f"{basin}.zarr"
+        elif self.cfg.dataset == 'forecast':
+            # Unified forecast config can still reuse legacy caches from prior dataset classes.
+            loader_types = {loader.config.type for loader in self._loaders}
+            candidates = []
+
+            # Perfect prognosis legacy cache
+            if loader_types == {'perfect_forecast'}:
+                candidates.append(self.cfg.data_dir / "zarr_cache_perfect" / f"{basin}.zarr")
+
+            # Combined GEFS + ICON-D2 legacy cache
+            if 'icond2' in loader_types:
+                candidates.append(self.cfg.data_dir / "zarr_cache" / f"{basin}_combined.zarr")
+
+            # GEFS-only legacy cache
+            if 'gefs' in loader_types:
+                candidates.append(self.cfg.data_dir / "zarr_cache" / f"{basin}.zarr")
+
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate
+            return None
         else:
             return None
         return path if path.exists() else None
@@ -463,48 +490,53 @@ class ForecastDataset(GenericDataset):
             If no data could be loaded for any basin.
         """
         basin_datasets = []
+        use_zarr_cache = self._zarr_available
 
-        # Unified cache directory
-        cache_dir = self.cfg.data_dir / "zarr_cache_unified"
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        if use_zarr_cache:
+            # Unified cache directory
+            cache_dir = self.cfg.data_dir / "zarr_cache_unified"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            cache_dir = None
 
         cache_key = self._create_cache_key()
 
         for basin in self.basins:
-            cache_path = cache_dir / f"{basin}_{cache_key}.zarr"
+            cache_path = cache_dir / f"{basin}_{cache_key}.zarr" if use_zarr_cache else None
 
-            # Try loading from unified cache
-            if cache_path.exists():
-                LOGGER.info(f"Loading cached dataset for basin {basin} from {cache_path}")
-                try:
-                    ds = xr.open_zarr(store=cache_path, decode_timedelta=True)
-                    if self._validate_cache(ds):
-                        basin_datasets.append(ds)
-                        continue
-                    else:
-                        LOGGER.info(f"Cache validation failed for basin {basin}. Rebuilding.")
-                        ds.close()
-                        shutil.rmtree(cache_path)
-                except Exception as e:
-                    LOGGER.warning(f"Failed to load cache for basin {basin}: {e}. Rebuilding.")
-                    if cache_path.exists():
-                        shutil.rmtree(cache_path)
+            if use_zarr_cache:
+                # Try loading from unified cache
+                if cache_path.exists():
+                    LOGGER.info(f"Loading cached dataset for basin {basin} from {cache_path}")
+                    try:
+                        ds = xr.open_zarr(store=cache_path, decode_timedelta=True)
+                        if self._validate_cache(ds):
+                            basin_datasets.append(ds)
+                            continue
+                        else:
+                            LOGGER.info(f"Cache validation failed for basin {basin}. Rebuilding.")
+                            ds.close()
+                            shutil.rmtree(cache_path)
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to load cache for basin {basin}: {e}. Rebuilding.")
+                        if cache_path.exists():
+                            shutil.rmtree(cache_path)
 
-            # Try loading from legacy cache (existing zarr from old dataset classes)
-            legacy_path = self._get_legacy_cache_path(basin)
-            if legacy_path is not None:
-                LOGGER.info(f"Loading legacy cache for basin {basin} from {legacy_path}")
-                try:
-                    ds = xr.open_zarr(store=legacy_path, decode_timedelta=True)
-                    ds = self._clean_legacy_dims(ds)
-                    if self._validate_legacy_cache(ds):
-                        basin_datasets.append(ds)
-                        continue
-                    else:
-                        LOGGER.warning(f"Legacy cache validation failed for basin {basin}.")
-                        ds.close()
-                except Exception as e:
-                    LOGGER.warning(f"Failed to load legacy cache for basin {basin}: {e}")
+                # Try loading from legacy cache (existing zarr from old dataset classes)
+                legacy_path = self._get_legacy_cache_path(basin)
+                if legacy_path is not None:
+                    LOGGER.info(f"Loading legacy cache for basin {basin} from {legacy_path}")
+                    try:
+                        ds = xr.open_zarr(store=legacy_path, decode_timedelta=True)
+                        ds = self._clean_legacy_dims(ds)
+                        if self._validate_legacy_cache(ds):
+                            basin_datasets.append(ds)
+                            continue
+                        else:
+                            LOGGER.warning(f"Legacy cache validation failed for basin {basin}.")
+                            ds.close()
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to load legacy cache for basin {basin}: {e}")
 
             # Build and cache if neither unified nor legacy cache available
             ds = self._build_and_cache_basin_dataset(basin, cache_path)
@@ -530,15 +562,15 @@ class ForecastDataset(GenericDataset):
 
         return merged
 
-    def _build_and_cache_basin_dataset(self, basin: str, cache_path: Path) -> xr.Dataset:
+    def _build_and_cache_basin_dataset(self, basin: str, cache_path: Optional[Path]) -> xr.Dataset:
         """Build dataset for one basin from all loaders.
 
         Parameters
         ----------
         basin : str
             Basin ID.
-        cache_path : Path
-            Path to save cached dataset.
+        cache_path : Optional[Path]
+            Path to save cached dataset. If None, no zarr cache will be written.
 
         Returns
         -------
@@ -622,6 +654,9 @@ class ForecastDataset(GenericDataset):
         LOGGER.info(f"Computing dataset for {basin}...")
         merged = merged.compute()
 
+        if (cache_path is None) or (not self._zarr_available):
+            return merged
+
         LOGGER.info(f"Saving cache: {cache_path}")
         # Ensure basin is string type for zarr compatibility
         if 'basin' in merged.coords:
@@ -653,8 +688,43 @@ class ForecastDataset(GenericDataset):
         ValueError
             If datasets have no overlapping time period.
         """
+        required_lead_time = max(self._forecast_seq_len) if self._forecast_seq_len else 0
+
         if len(datasets) == 1:
-            return datasets[0]
+            ds = datasets[0]
+            loader = self._loaders[0]
+
+            if 'lead_time' not in ds.dims:
+                return ds
+
+            max_lead_time = int(ds.lead_time.values.max())
+            target_lead_time = max(max_lead_time, required_lead_time)
+            if target_lead_time <= max_lead_time and not self._should_add_availability_mask(loader.config.name):
+                return ds
+
+            LOGGER.info(
+                "Single forecast source '%s': padding lead_time from %dh to %dh",
+                loader.config.name,
+                max_lead_time,
+                target_lead_time,
+            )
+
+            lead_time_range = np.arange(1, target_lead_time + 1)
+            valid_leads = set(int(lt) for lt in ds.lead_time.values)
+            ds_padded = ds.reindex(lead_time=lead_time_range, fill_value=0.0)
+
+            if self._should_add_availability_mask(loader.config.name):
+                mask_name = f"{loader.config.name}_available"
+                template_var = list(ds_padded.data_vars)[0]
+                mask = xr.zeros_like(ds_padded[template_var])
+                for lead in lead_time_range:
+                    if lead in valid_leads:
+                        mask.loc[{'lead_time': lead}] = 1.0
+                mask.name = mask_name
+                ds_padded = xr.merge([ds_padded, mask])
+                LOGGER.info("Added availability mask: %s", mask_name)
+
+            return ds_padded
 
         LOGGER.info(f"Merging {len(datasets)} forecast sources...")
 
@@ -687,9 +757,15 @@ class ForecastDataset(GenericDataset):
 
         # Determine maximum lead_time
         max_lead_time = max(int(ds.lead_time.values.max()) for ds in aligned)
-        lead_time_range = np.arange(1, max_lead_time + 1)
+        target_lead_time = max(max_lead_time, required_lead_time)
+        lead_time_range = np.arange(1, target_lead_time + 1)
 
-        LOGGER.info(f"Padding to maximum lead_time: {max_lead_time}h")
+        LOGGER.info(
+            "Padding forecast sources to lead_time: %dh (data max=%dh, required=%dh)",
+            target_lead_time,
+            max_lead_time,
+            required_lead_time,
+        )
 
         # Pad shorter forecasts and add availability masks
         padded = []

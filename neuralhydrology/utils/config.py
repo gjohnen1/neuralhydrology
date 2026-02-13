@@ -461,6 +461,14 @@ class Config(object):
         return self._cfg.get("forecast_seq_length", None)
 
     @property
+    def forecast_sources(self) -> List[Dict[str, Any]]:
+        return self._as_default_list(self._cfg.get("forecast_sources", []))
+
+    @property
+    def forecast_availability_masks(self) -> Dict[str, bool]:
+        return self._as_default_dict(self._cfg.get("forecast_availability_masks", {}))
+
+    @property
     def forcings(self) -> List[str]:
         return self._as_default_list(self._get_value_verbose("forcings"))
 

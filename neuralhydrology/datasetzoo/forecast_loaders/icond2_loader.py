@@ -55,6 +55,26 @@ class ICOND2Loader(ForecastLoader):
 
     HORIZON_HOURS = 48
 
+    def _drop_gauge_id(self, ds: xr.Dataset, source_name: str) -> xr.Dataset:
+        """Drop/squeeze gauge dimension to keep tensors 2D over issue_time x lead_time.
+
+        Some ICON-D2 files carry a singleton ``gauge_id`` dimension even for per-catchment files.
+        ForecastDataset expects forecast variables with dimensions ``(issue_time, lead_time)``
+        (plus basin at merge stage), so we collapse ``gauge_id`` to avoid transpose failures.
+        """
+        if 'gauge_id' in ds.dims:
+            gauge_count = int(ds.sizes.get('gauge_id', 0))
+            if gauge_count > 1:
+                self.logger.warning(
+                    "ICON-D2 %s has %d gauge_id entries. Selecting the first entry for catchment-aligned loading.",
+                    source_name,
+                    gauge_count,
+                )
+            ds = ds.isel(gauge_id=0, drop=True)
+        elif 'gauge_id' in ds.coords:
+            ds = ds.drop_vars('gauge_id')
+        return ds
+
     def __init__(self, config, cfg):
         """Initialize ICON-D2 loader.
 
@@ -161,15 +181,18 @@ class ICOND2Loader(ForecastLoader):
 
         Notes
         -----
-        This is a simple heuristic. In practice, you might need to customize this
-        based on your data. Currently assumes precipitation variables need quartiles.
+        Variables like precipitation appear in both deterministic and ensemble files.
+        The deterministic value produces a suffixed variable (e.g., precipitation_mean_icond2),
+        while the ensemble produces quartile-suffixed variables (e.g., precipitation_mean_icond2_q25).
+        This matches the legacy CombinedForecastDataset behavior.
         """
         det_vars = []
         ens_vars = []
 
         for var in self.config.variables:
-            # Simple heuristic: precipitation typically has ensemble forecasts
             if 'precipitation' in var.lower():
+                # Precipitation exists in both deterministic and ensemble files
+                det_vars.append(var)
                 ens_vars.append(var)
             else:
                 det_vars.append(var)
@@ -221,6 +244,7 @@ class ICOND2Loader(ForecastLoader):
                 return None
 
             ds = ds[available]
+            ds = self._drop_gauge_id(ds, source_name=det_path.name)
 
             # Add suffix to variable names
             rename_map = {v: self.add_suffix(v) for v in available}
@@ -270,6 +294,7 @@ class ICOND2Loader(ForecastLoader):
                 return None
 
             ds = ds[available]
+            ds = self._drop_gauge_id(ds, source_name=ens_path.name)
 
             # Compute quartiles
             ds_quartiles = QuartileComputer.compute_as_variables(
@@ -281,6 +306,8 @@ class ICOND2Loader(ForecastLoader):
             # Standardize dimension names
             if 'init_time' in ds_quartiles.dims:
                 ds_quartiles = ds_quartiles.rename({'init_time': 'issue_time'})
+
+            ds_quartiles = self._drop_gauge_id(ds_quartiles, source_name=ens_path.name)
 
             # Drop gauge_id if present
             if 'gauge_id' in ds_quartiles.coords:
