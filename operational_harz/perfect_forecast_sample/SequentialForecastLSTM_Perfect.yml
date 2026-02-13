@@ -243,7 +243,30 @@ save_validation_results: False
 # --- Data configurations --------------------------------------------------------------------------
 
 # which data set to use [camels_us, camels_gb, global, hourly_camels_us, camels_cl, generic]
-dataset: perfect_forecast
+dataset: forecast
+
+# Forecast source configuration
+forecast_sources:
+  - name: perfect
+    type: perfect_forecast
+    suffix: _perfect
+    variables:
+      - temperature_2m
+      - relative_humidity_2m
+      - dew_point_2m
+      - precipitation
+      - rain
+      - snowfall
+      - surface_pressure
+      - et0_fao_evapotranspiration
+      - wind_direction_10m
+      - soil_moisture_0_to_7cm
+      - soil_moisture_7_to_28cm
+      - soil_moisture_28_to_100cm
+      - shortwave_radiation
+    quartiles: []
+    loader_kwargs:
+      max_horizon: 240
 
 # Path to data set root
 data_dir: ../../data/harz

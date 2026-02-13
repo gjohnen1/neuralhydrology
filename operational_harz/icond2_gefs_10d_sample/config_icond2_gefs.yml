@@ -242,7 +242,35 @@ save_validation_results: False
 # --- Data configurations --------------------------------------------------------------------------
 
 # which data set to use [camels_us, camels_gb, global, hourly_camels_us, camels_cl, generic]
-dataset: combined_forecast
+dataset: forecast
+
+# Forecast source configuration
+forecast_sources:
+  - name: gefs
+    type: gefs
+    suffix: _gefs
+    variables:
+      - maximum_temperature_2m
+      - minimum_temperature_2m
+      - precipitation_surface
+      - relative_humidity_2m
+      - temperature_2m
+    quartiles: [0.25, 0.5, 0.75]
+    loader_kwargs:
+      max_hours: 240
+  - name: icond2
+    type: icond2
+    suffix: _icond2
+    variables:
+      - precipitation_mean
+      - temperature_mean
+    quartiles: [0.25, 0.5, 0.75]
+    loader_kwargs:
+      horizon_hours: 48
+
+# Availability masks for forecast sources with shorter horizons
+forecast_availability_masks:
+  icond2: true
 
 # Path to data set root
 data_dir: ../../data/harz
