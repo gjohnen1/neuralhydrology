@@ -80,7 +80,7 @@ class ForecastDataset(GenericDataset):
         Cache version string for invalidation.
     """
 
-    CACHE_VERSION = "unified-v1"
+    CACHE_VERSION = "unified-v2"
 
     def __init__(self,
                  cfg: Config,
@@ -711,7 +711,7 @@ class ForecastDataset(GenericDataset):
 
             lead_time_range = np.arange(1, target_lead_time + 1)
             valid_leads = set(int(lt) for lt in ds.lead_time.values)
-            ds_padded = ds.reindex(lead_time=lead_time_range, fill_value=0.0)
+            ds_padded = ds.reindex(lead_time=lead_time_range, fill_value=np.nan)
 
             if self._should_add_availability_mask(loader.config.name):
                 mask_name = f"{loader.config.name}_available"
@@ -775,8 +775,8 @@ class ForecastDataset(GenericDataset):
             # Store valid lead times before padding
             valid_leads = set(int(lt) for lt in ds.lead_time.values)
 
-            # Reindex to full range (zero-padding)
-            ds_padded = ds.reindex(lead_time=lead_time_range, fill_value=0.0)
+            # Reindex to full range (NaN-padding for shorter-horizon sources)
+            ds_padded = ds.reindex(lead_time=lead_time_range, fill_value=np.nan)
 
             # Add availability mask if configured
             if self._should_add_availability_mask(loader.config.name):
@@ -1342,6 +1342,23 @@ class ForecastDataset(GenericDataset):
                     fc_tensor_list.append(da.values[:, np.newaxis])
 
             fc_tensor = np.stack(fc_tensor_list, axis=-1).astype(np.float32)
+
+            # Replace NaN (from lead-time padding of shorter-horizon forecast sources) with 0.0.
+            # After z-score normalization, 0.0 represents the feature mean -- a neutral value
+            # that won't bias the LSTM when a forecast source is unavailable.
+            fc_tensor = np.nan_to_num(fc_tensor, nan=0.0)
+
+            # Apply explicit input gating: multiply features from shorter-horizon sources
+            # by their availability mask, so padded lead times are cleanly zeroed out.
+            if self.cfg.forecast_input_gating:
+                for mask_name, gated_features in self.cfg.forecast_input_gating.items():
+                    if mask_name in available_forecast:
+                        mask_idx = available_forecast.index(mask_name)
+                        mask_col = fc_tensor[:, :, mask_idx]
+                        for feat_name in gated_features:
+                            if feat_name in available_forecast:
+                                feat_idx = available_forecast.index(feat_name)
+                                fc_tensor[:, :, feat_idx] *= mask_col
 
             required_len = max(self._forecast_seq_len)
             if fc_tensor.shape[1] < required_len:
