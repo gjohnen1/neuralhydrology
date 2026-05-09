@@ -85,20 +85,34 @@ def fetch_forecasts_for_basins(ds: xr.Dataset, centroids: pd.DataFrame,
     """
     if init_time is not None:
         ds = ds.sel(init_time=init_time)
-    
-    basin_data_list = []
-    
-    for idx, row in centroids.iterrows():
-        basin_name = row['basin_name']
-        lat = row['latitude']
-        lon = row['longitude']
-        
-        basin_ds = ds.sel(latitude=lat, longitude=lon, method="nearest")
-        basin_ds = basin_ds.assign_coords(basin=basin_name)
-        basin_data_list.append(basin_ds)
-    
-    combined_ds = xr.concat(basin_data_list, dim="basin")
-    
+
+    if centroids.empty:
+        raise ValueError("No basin centroids supplied.")
+
+    basin_names = centroids['basin_name'].astype(str).to_numpy()
+    latitudes = centroids['latitude'].to_numpy(dtype=float)
+    longitudes = centroids['longitude'].to_numpy(dtype=float)
+
+    if 'longitude' in ds.coords:
+        lon_min = float(ds.longitude.min())
+        lon_max = float(ds.longitude.max())
+        if lon_min < 0 <= lon_max:
+            longitudes = ((longitudes + 180) % 360) - 180
+        elif lon_min >= 0:
+            longitudes = longitudes % 360
+
+    basin_coord = pd.Index(basin_names, name='basin')
+    lat_indexer = xr.DataArray(latitudes, dims='basin', coords={'basin': basin_coord})
+    lon_indexer = xr.DataArray(longitudes, dims='basin', coords={'basin': basin_coord})
+
+    combined_ds = ds.sel(latitude=lat_indexer, longitude=lon_indexer, method="nearest")
+
+    ordered_dims = [dim for dim in ('basin', 'init_time', 'ensemble_member', 'lead_time')
+                    if dim in combined_ds.dims]
+    remaining_dims = [dim for dim in combined_ds.dims if dim not in ordered_dims]
+    if ordered_dims:
+        combined_ds = combined_ds.transpose(*(ordered_dims + remaining_dims), missing_dims='ignore')
+
     return combined_ds
 
 
