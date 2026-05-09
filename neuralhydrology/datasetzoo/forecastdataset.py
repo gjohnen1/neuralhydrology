@@ -613,40 +613,45 @@ class ForecastDataset(GenericDataset):
         NoTrainDataError, NoEvaluationDataError
             If no data could be loaded for any basin.
         """
-        basin_datasets = []
-        use_zarr_cache = self._zarr_available
-
-        if use_zarr_cache:
-            # Unified cache directory
-            cache_dir = self.cfg.data_dir / "zarr_cache_unified"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            cache_dir = None
+        basin_datasets = {}
+        missing_basins = []
+        cache_dir = self.cfg.data_dir / "forecast_cache_unified"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        zarr_cache_dir = self.cfg.data_dir / "zarr_cache_unified"
 
         cache_key = self._create_cache_key()
 
         for basin in self.basins:
-            cache_path = cache_dir / f"{basin}_{cache_key}.zarr" if use_zarr_cache else None
+            cache_path = self._get_unified_cache_path(cache_dir, basin, cache_key)
+            if cache_path.exists():
+                LOGGER.info(f"Loading cached dataset for basin {basin} from {cache_path}")
+                try:
+                    ds = self._open_unified_cache(cache_path)
+                    if self._validate_cache(ds):
+                        basin_datasets[basin] = ds
+                        continue
+                    LOGGER.info(f"Cache validation failed for basin {basin}. Rebuilding.")
+                    ds.close()
+                    cache_path.unlink()
+                except Exception as e:
+                    LOGGER.warning(f"Failed to load cache for basin {basin}: {e}. Rebuilding.")
+                    if cache_path.exists():
+                        cache_path.unlink()
 
-            if use_zarr_cache:
-                # Try loading from unified cache
-                if cache_path.exists():
-                    LOGGER.info(f"Loading cached dataset for basin {basin} from {cache_path}")
+            if self._zarr_available:
+                zarr_cache_path = zarr_cache_dir / f"{basin}_{cache_key}.zarr"
+                if zarr_cache_path.exists():
+                    LOGGER.info(f"Loading legacy unified zarr cache for basin {basin} from {zarr_cache_path}")
                     try:
-                        ds = xr.open_zarr(store=cache_path, decode_timedelta=True)
+                        ds = xr.open_zarr(store=zarr_cache_path, decode_timedelta=True)
                         if self._validate_cache(ds):
-                            basin_datasets.append(ds)
+                            basin_datasets[basin] = ds
                             continue
-                        else:
-                            LOGGER.info(f"Cache validation failed for basin {basin}. Rebuilding.")
-                            ds.close()
-                            shutil.rmtree(cache_path)
+                        LOGGER.info(f"Legacy unified zarr validation failed for basin {basin}.")
+                        ds.close()
                     except Exception as e:
-                        LOGGER.warning(f"Failed to load cache for basin {basin}: {e}. Rebuilding.")
-                        if cache_path.exists():
-                            shutil.rmtree(cache_path)
+                        LOGGER.warning(f"Failed to load legacy unified zarr for basin {basin}: {e}")
 
-                # Try loading from legacy cache (existing zarr from old dataset classes)
                 legacy_path = self._get_legacy_cache_path(basin)
                 if legacy_path is not None:
                     LOGGER.info(f"Loading legacy cache for basin {basin} from {legacy_path}")
@@ -654,17 +659,18 @@ class ForecastDataset(GenericDataset):
                         ds = xr.open_zarr(store=legacy_path, decode_timedelta=True)
                         ds = self._clean_legacy_dims(ds)
                         if self._validate_legacy_cache(ds):
-                            basin_datasets.append(ds)
+                            basin_datasets[basin] = ds
                             continue
-                        else:
-                            LOGGER.warning(f"Legacy cache validation failed for basin {basin}.")
-                            ds.close()
+                        LOGGER.warning(f"Legacy cache validation failed for basin {basin}.")
+                        ds.close()
                     except Exception as e:
                         LOGGER.warning(f"Failed to load legacy cache for basin {basin}: {e}")
 
-            # Build and cache if neither unified nor legacy cache available
-            ds = self._build_and_cache_basin_dataset(basin, cache_path)
-            basin_datasets.append(ds)
+            missing_basins.append(basin)
+
+        if missing_basins:
+            built_datasets = self._build_and_cache_basin_datasets(missing_basins, cache_dir, cache_key)
+            basin_datasets.update(built_datasets)
 
         if not basin_datasets:
             if self.is_train:
@@ -672,7 +678,8 @@ class ForecastDataset(GenericDataset):
             raise NoEvaluationDataError
 
         # Merge all basin datasets
-        merged = xr.concat(basin_datasets, dim='basin')
+        ordered_datasets = [basin_datasets[basin] for basin in self.basins if basin in basin_datasets]
+        merged = xr.concat(ordered_datasets, dim='basin')
 
         # Infer frequency if needed
         if not self.frequencies:
@@ -686,6 +693,53 @@ class ForecastDataset(GenericDataset):
 
         return merged
 
+    @staticmethod
+    def _get_unified_cache_path(cache_dir: Path, basin: str, cache_key: str) -> Path:
+        """Return the path for the NetCDF-backed unified cache file."""
+        return cache_dir / f"{basin}_{cache_key}.nc"
+
+    @staticmethod
+    def _cache_safe_attrs(attrs: Dict) -> Dict:
+        """Convert cache metadata to NetCDF-safe attribute values."""
+        safe_attrs = {}
+        for key, value in attrs.items():
+            if isinstance(value, (str, int, float, np.number)):
+                safe_attrs[key] = value
+            elif value is None:
+                safe_attrs[key] = ""
+            else:
+                safe_attrs[key] = str(value)
+        return safe_attrs
+
+    def _open_unified_cache(self, cache_path: Path) -> xr.Dataset:
+        """Open a NetCDF unified cache and load it into memory."""
+        ds = xr.open_dataset(cache_path, decode_timedelta=True)
+        try:
+            return ds.load()
+        finally:
+            ds.close()
+
+    def _write_unified_cache(self, ds: xr.Dataset, cache_path: Path):
+        """Write a computed basin dataset to the NetCDF unified cache."""
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(f".{cache_path.name}.tmp")
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+        ds_to_write = ds.copy(deep=False)
+        ds_to_write.attrs = self._cache_safe_attrs(ds_to_write.attrs)
+        encoding = {}
+        for var_name in ds_to_write.data_vars:
+            if np.issubdtype(ds_to_write[var_name].dtype, np.number):
+                encoding[var_name] = {'zlib': True, 'complevel': 1}
+
+        try:
+            ds_to_write.to_netcdf(tmp_path, mode='w', engine='netcdf4', encoding=encoding)
+            tmp_path.replace(cache_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
     def _build_and_cache_basin_dataset(self, basin: str, cache_path: Optional[Path]) -> xr.Dataset:
         """Build dataset for one basin from all loaders.
 
@@ -694,7 +748,7 @@ class ForecastDataset(GenericDataset):
         basin : str
             Basin ID.
         cache_path : Optional[Path]
-            Path to save cached dataset. If None, no zarr cache will be written.
+            Path to save cached dataset. If None, no unified cache will be written.
 
         Returns
         -------
@@ -706,19 +760,28 @@ class ForecastDataset(GenericDataset):
         ValueError
             If data loading fails.
         """
-        LOGGER.info(f"Building dataset for basin {basin}...")
+        cache_dir = cache_path.parent if cache_path is not None else None
+        cache_key = cache_path.stem.split(f"{basin}_", 1)[-1] if cache_path is not None else self._create_cache_key()
+        return self._build_and_cache_basin_datasets([basin], cache_dir, cache_key)[basin]
+
+    def _build_and_cache_basin_datasets(self,
+                                        basins: List[str],
+                                        cache_dir: Optional[Path],
+                                        cache_key: str) -> Dict[str, xr.Dataset]:
+        """Build datasets for missing basins in one loader pass."""
+        LOGGER.info(f"Building datasets for {len(basins)} basin(s): {basins}")
 
         # Load historical data (shared across all forecast types)
-        historical_ds = self._load_historical_xarray_data(basins=[basin])
+        historical_ds = self._load_historical_xarray_data(basins=basins)
         if historical_ds is None:
-            raise ValueError(f"Failed to load historical data for basin {basin}")
+            raise ValueError(f"Failed to load historical data for basins {basins}")
 
         # Load forecasts from all loaders
         forecast_datasets = []
         for loader in self._loaders:
             try:
-                LOGGER.info(f"Loading {loader.config.name} forecasts for basin {basin}...")
-                loader_ds = loader.load(basins=[basin])
+                LOGGER.info(f"Loading {loader.config.name} forecasts for {len(basins)} basin(s)...")
+                loader_ds = loader.load(basins=basins)
                 if loader_ds is not None:
                     forecast_datasets.append(loader_ds)
                     LOGGER.info(
@@ -726,14 +789,14 @@ class ForecastDataset(GenericDataset):
                         f"{loader.get_horizon_hours()}h horizon"
                     )
                 else:
-                    LOGGER.warning(f"Loader {loader.config.name} returned no data for basin {basin}")
+                    LOGGER.warning(f"Loader {loader.config.name} returned no data for basins {basins}")
             except Exception as e:
-                LOGGER.error(f"Loader {loader.config.name} failed for basin {basin}: {e}")
+                LOGGER.error(f"Loader {loader.config.name} failed for basins {basins}: {e}")
                 if self.is_train:
                     raise  # Fail fast during training
 
         if not forecast_datasets:
-            raise ValueError(f"No forecast data loaded for basin {basin}")
+            raise ValueError(f"No forecast data loaded for basins {basins}")
 
         # Merge forecast sources
         forecast_ds = self._merge_forecast_sources(forecast_datasets)
@@ -746,6 +809,40 @@ class ForecastDataset(GenericDataset):
         forecast_ds = forecast_ds.sortby('issue_time')
         historical_ds = historical_ds.sortby('time')
 
+        built = {}
+        available_forecast_basins = set(str(basin) for basin in forecast_ds.basin.values)
+        available_historical_basins = set(str(basin) for basin in historical_ds.basin.values)
+        for basin in basins:
+            if basin not in available_forecast_basins:
+                LOGGER.warning("Forecast data missing for basin %s - skipping cache build.", basin)
+                continue
+            if basin not in available_historical_basins:
+                LOGGER.warning("Historical data missing for basin %s - skipping cache build.", basin)
+                continue
+
+            basin_historical = historical_ds.sel(basin=[basin])
+            basin_forecast = forecast_ds.sel(basin=[basin])
+            merged = self._finalize_basin_dataset(basin, basin_historical, basin_forecast)
+            merged = merged.load()
+
+            if cache_dir is not None:
+                cache_path = self._get_unified_cache_path(cache_dir, basin, cache_key)
+                LOGGER.info(f"Saving unified NetCDF cache: {cache_path}")
+                self._write_unified_cache(merged, cache_path)
+                merged = self._open_unified_cache(cache_path)
+
+            built[basin] = merged
+
+        if not built:
+            raise ValueError(f"No datasets could be built for basins {basins}")
+
+        return built
+
+    def _finalize_basin_dataset(self,
+                                basin: str,
+                                historical_ds: xr.Dataset,
+                                forecast_ds: xr.Dataset) -> xr.Dataset:
+        """Align, slice, and merge one basin's historical and forecast data."""
         # Determine time slice range
         hist_start = pd.to_datetime(historical_ds['time'].values[0])
         hist_end = pd.to_datetime(historical_ds['time'].values[-1])
@@ -771,28 +868,10 @@ class ForecastDataset(GenericDataset):
         # Add metadata
         merged.attrs['forecast_cache_version'] = self.CACHE_VERSION
         merged.attrs['basin'] = basin
-        merged.attrs['loaders'] = [l.config.name for l in self._loaders]
+        merged.attrs['loaders'] = ",".join(l.config.name for l in self._loaders)
         merged.attrs.update(self._availability.to_attrs())
 
-        # Compute and save
-        LOGGER.info(f"Computing dataset for {basin}...")
-        merged = merged.compute()
-
-        if (cache_path is None) or (not self._zarr_available):
-            return merged
-
-        LOGGER.info(f"Saving cache: {cache_path}")
-        # Ensure basin is string type for zarr compatibility
-        if 'basin' in merged.coords:
-            merged['basin'] = merged['basin'].astype(str)
-
-        merged.to_zarr(store=cache_path, mode='w')
-        merged.close()
-
-        # Reload from cache
-        ds_cached = xr.open_zarr(store=cache_path, decode_timedelta=True)
-
-        return ds_cached
+        return merged
 
     def _merge_forecast_sources(self, datasets: List[xr.Dataset]) -> xr.Dataset:
         """Merge multiple forecast sources with alignment and padding.
@@ -1265,6 +1344,33 @@ class ForecastDataset(GenericDataset):
 
         return np.stack(fc_tensor_list, axis=-1).astype(np.float32)
 
+    @staticmethod
+    def _fill_leading_forecast_nans(fc_tensor: np.ndarray) -> np.ndarray:
+        """Fill only leading NaN prefixes along lead_time.
+
+        Some forecast products cannot provide lead 0/1 for derived quantities
+        (for example accumulated precipitation converted to rates), while later
+        leads are valid. The previous broad backfill hid all internal gaps. This
+        bounded fill keeps those first-lead artifacts trainable without masking
+        missing values after the first finite lead.
+        """
+        filled = fc_tensor.copy()
+        finite = np.isfinite(filled)
+
+        for issue_idx in range(filled.shape[0]):
+            for feature_idx in range(filled.shape[2]):
+                finite_leads = np.flatnonzero(finite[issue_idx, :, feature_idx])
+                if finite_leads.size == 0:
+                    continue
+
+                first_valid = finite_leads[0]
+                if first_valid > 0:
+                    filled[issue_idx, :first_valid, feature_idx] = filled[
+                        issue_idx, first_valid, feature_idx
+                    ]
+
+        return filled
+
     def _allowed_forecast_nan_mask(self, fc_tensor: np.ndarray, available_forecast: List[str]) -> np.ndarray:
         """Return NaN positions that are expected because a gated source is unavailable."""
         allowed = np.zeros(fc_tensor.shape, dtype=bool)
@@ -1510,13 +1616,14 @@ class ForecastDataset(GenericDataset):
 
             fc_inputs = basin_fcst[available_forecast]
             fc_tensor_raw = self._stack_forecast_inputs(fc_inputs, available_forecast, issue_dim)
-            allowed_forecast_nans = self._allowed_forecast_nan_mask(fc_tensor_raw, available_forecast)
-            invalid_forecast_nans = np.isnan(fc_tensor_raw) & ~allowed_forecast_nans
+            fc_tensor_filled = self._fill_leading_forecast_nans(fc_tensor_raw)
+            allowed_forecast_nans = self._allowed_forecast_nan_mask(fc_tensor_filled, available_forecast)
+            invalid_forecast_nans = np.isnan(fc_tensor_filled) & ~allowed_forecast_nans
 
             # Replace only after building the validity mask. After z-score normalization,
             # 0.0 represents the feature mean and is reserved for intentionally unavailable
             # gated forecast sources.
-            fc_tensor = np.nan_to_num(fc_tensor_raw, nan=0.0)
+            fc_tensor = np.nan_to_num(fc_tensor_filled, nan=0.0)
 
             # Apply explicit input gating: multiply features from shorter-horizon sources
             # by their availability mask, so padded lead times are cleanly zeroed out.
