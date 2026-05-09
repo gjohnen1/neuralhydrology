@@ -382,6 +382,130 @@ class ForecastDataset(GenericDataset):
             self._forecast_seq_len = [self._forecast_seq_len]
             self._predict_last_n = [self._predict_last_n]
 
+    def _load_data(self):
+        """Load forecast data with split-safe normalization.
+
+        ForecastDataset keeps raw caches independent of train/validation/test
+        periods, so normalization must explicitly select the active period before
+        computing train scalers. This mirrors BaseDataset's split isolation while
+        preserving the full raw archive for later lookup-table construction.
+        """
+        self._load_combined_attributes()
+
+        xr_dataset = self._load_or_create_xarray_dataset()
+
+        period_xr = self._slice_xarray_to_period(xr_dataset)
+        if self.cfg.loss.lower() in ['nse', 'weightednse']:
+            self._calculate_per_basin_std(period_xr)
+
+        if self._compute_scaler:
+            self._setup_normalization(period_xr)
+
+        xr_dataset = (xr_dataset - self.scaler["xarray_feature_center"]) / self.scaler["xarray_feature_scale"]
+
+        self._create_lookup_table(xr_dataset)
+
+    def _period_windows(self, basin: str) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+        """Return inclusive period windows for a basin.
+
+        Config end dates are day-level in the standard configs. Match the
+        existing forecast issue filtering behavior by treating each end date as
+        inclusive through the end of that day.
+        """
+        start_dates = self.start_and_end_dates.get(basin, {}).get('start_dates', [])
+        end_dates = self.start_and_end_dates.get(basin, {}).get('end_dates', [])
+
+        windows = []
+        for start_date, end_date in zip(start_dates, end_dates):
+            start = pd.to_datetime(start_date)
+            end = pd.to_datetime(end_date) + pd.Timedelta(days=1, seconds=-1)
+            windows.append((start, end))
+        return windows
+
+    def _forecast_horizon_offset(self, time_values: np.ndarray) -> Optional[pd.DateOffset]:
+        """Return the maximum target-horizon offset implied by the config."""
+        if len(time_values) < 2:
+            return None
+
+        freq = utils.infer_frequency(time_values)
+        freq_offset = pd.tseries.frequencies.to_offset(freq)
+        max_horizon_steps = max(self._forecast_offset + seq_len for seq_len in self._forecast_seq_len)
+        return max_horizon_steps * freq_offset
+
+    def _slice_xarray_to_period(self, xr_dataset: xr.Dataset) -> xr.Dataset:
+        """Slice a raw forecast dataset to the active period for scaler fitting.
+
+        Historical inputs keep their warmup context, but targets outside the
+        active period are masked before scaler statistics are computed. Forecast
+        issue times are kept only if their configured forecast horizon remains
+        inside the same period.
+        """
+        if 'basin' not in xr_dataset.coords:
+            return xr_dataset
+
+        time_dim = 'time' if 'time' in xr_dataset.dims else ('date' if 'date' in xr_dataset.dims else None)
+        issue_dim = 'issue_time' if 'issue_time' in xr_dataset.dims else None
+
+        time_values = xr_dataset[time_dim].values if time_dim is not None else np.array([])
+        if time_dim is not None and len(time_values) > 1:
+            freq = utils.infer_frequency(time_values)
+            freq_offset = pd.tseries.frequencies.to_offset(freq)
+            warmup_offset = max(self.seq_len) * freq_offset
+            horizon_offset = self._forecast_horizon_offset(time_values)
+        else:
+            warmup_offset = None
+            horizon_offset = None
+
+        basin_datasets = []
+        for basin in self.basins:
+            if basin not in xr_dataset['basin'].values:
+                continue
+
+            basin_ds = xr_dataset.sel(basin=[basin])
+            windows = self._period_windows(basin)
+            if not windows:
+                basin_datasets.append(basin_ds)
+                continue
+
+            if time_dim is not None:
+                time_index = pd.to_datetime(basin_ds[time_dim].values)
+                time_mask = np.zeros(time_index.size, dtype=bool)
+                target_mask = np.zeros(time_index.size, dtype=bool)
+                for start, end in windows:
+                    warmup_start = start - warmup_offset if warmup_offset is not None else start
+                    time_mask |= (time_index >= warmup_start) & (time_index <= end)
+                    target_mask |= (time_index >= start) & (time_index <= end)
+
+                basin_ds = basin_ds.sel({time_dim: basin_ds[time_dim].values[time_mask]})
+
+                if self.cfg.target_variables:
+                    target_mask = target_mask[time_mask]
+                    target_da = xr.DataArray(
+                        target_mask,
+                        coords={time_dim: basin_ds[time_dim]},
+                        dims=(time_dim,),
+                    )
+                    for target in self.cfg.target_variables:
+                        if target in basin_ds:
+                            basin_ds[target] = basin_ds[target].where(target_da)
+
+            if issue_dim is not None:
+                issue_index = pd.to_datetime(basin_ds[issue_dim].values)
+                issue_mask = np.zeros(issue_index.size, dtype=bool)
+                for start, end in windows:
+                    if horizon_offset is None:
+                        issue_mask |= (issue_index >= start) & (issue_index <= end)
+                    else:
+                        issue_mask |= (issue_index >= start) & (issue_index + horizon_offset <= end)
+                basin_ds = basin_ds.sel({issue_dim: basin_ds[issue_dim].values[issue_mask]})
+
+            basin_datasets.append(basin_ds)
+
+        if not basin_datasets:
+            return xr_dataset.isel(basin=slice(0, 0))
+
+        return xr.concat(basin_datasets, dim='basin')
+
     def _get_legacy_cache_path(self, basin: str) -> Optional[Path]:
         """Check for existing legacy zarr caches.
 
@@ -1102,6 +1226,66 @@ class ForecastDataset(GenericDataset):
 
         return issue_index[mask].to_numpy(dtype='datetime64[ns]')
 
+    def _is_prediction_window_within_period(self,
+                                            basin: str,
+                                            date_values: np.ndarray,
+                                            forecast_end: int,
+                                            predict_last_n: int) -> bool:
+        """Check that all loss target timestamps remain in the configured period."""
+        if predict_last_n <= 0:
+            return True
+
+        loss_start = forecast_end - predict_last_n
+        loss_end = forecast_end - 1
+        if loss_start < 0 or loss_end >= len(date_values):
+            return False
+
+        first_loss_date = pd.to_datetime(date_values[loss_start])
+        last_loss_date = pd.to_datetime(date_values[loss_end])
+        for start, end in self._period_windows(basin):
+            if first_loss_date >= start and last_loss_date <= end:
+                return True
+
+        return False
+
+    @staticmethod
+    def _stack_forecast_inputs(fc_inputs: xr.Dataset,
+                               available_forecast: List[str],
+                               issue_dim: str) -> np.ndarray:
+        """Stack forecast variables into issue_time x lead_time x feature arrays."""
+        fc_tensor_list = []
+        for var in available_forecast:
+            da = fc_inputs[var]
+            if 'lead_time' in da.dims:
+                da = da.transpose(issue_dim, 'lead_time')
+                fc_tensor_list.append(da.values)
+            else:
+                da = da.transpose(issue_dim)
+                fc_tensor_list.append(da.values[:, np.newaxis])
+
+        return np.stack(fc_tensor_list, axis=-1).astype(np.float32)
+
+    def _allowed_forecast_nan_mask(self, fc_tensor: np.ndarray, available_forecast: List[str]) -> np.ndarray:
+        """Return NaN positions that are expected because a gated source is unavailable."""
+        allowed = np.zeros(fc_tensor.shape, dtype=bool)
+
+        if not self.cfg.forecast_input_gating:
+            return allowed
+
+        for mask_name, gated_features in self.cfg.forecast_input_gating.items():
+            if mask_name not in available_forecast:
+                continue
+
+            mask_idx = available_forecast.index(mask_name)
+            mask_values = fc_tensor[:, :, mask_idx]
+            unavailable = np.isfinite(mask_values) & (mask_values <= 0)
+            for feat_name in gated_features:
+                if feat_name in available_forecast:
+                    feat_idx = available_forecast.index(feat_name)
+                    allowed[:, :, feat_idx] |= unavailable
+
+        return allowed
+
     def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
         """Get a single sample for PyTorch DataLoader.
 
@@ -1325,28 +1509,14 @@ class ForecastDataset(GenericDataset):
             date_values = hindcast_df.index.to_numpy()
 
             fc_inputs = basin_fcst[available_forecast]
-            # NOAA GEFS precipitation rates are averaged since the previous step, so the first
-            # lead-time in each issue can be NaN after interpolation; fill forward to retain samples.
-            if 'lead_time' in fc_inputs.dims:
-                fc_inputs = fc_inputs.bfill(dim='lead_time')
+            fc_tensor_raw = self._stack_forecast_inputs(fc_inputs, available_forecast, issue_dim)
+            allowed_forecast_nans = self._allowed_forecast_nan_mask(fc_tensor_raw, available_forecast)
+            invalid_forecast_nans = np.isnan(fc_tensor_raw) & ~allowed_forecast_nans
 
-            # Manual stacking to avoid xarray.to_array() reshaping errors
-            fc_tensor_list = []
-            for var in available_forecast:
-                da = fc_inputs[var]
-                if 'lead_time' in da.dims:
-                    da = da.transpose(issue_dim, 'lead_time')
-                    fc_tensor_list.append(da.values)
-                else:
-                    da = da.transpose(issue_dim)
-                    fc_tensor_list.append(da.values[:, np.newaxis])
-
-            fc_tensor = np.stack(fc_tensor_list, axis=-1).astype(np.float32)
-
-            # Replace NaN (from lead-time padding of shorter-horizon forecast sources) with 0.0.
-            # After z-score normalization, 0.0 represents the feature mean -- a neutral value
-            # that won't bias the LSTM when a forecast source is unavailable.
-            fc_tensor = np.nan_to_num(fc_tensor, nan=0.0)
+            # Replace only after building the validity mask. After z-score normalization,
+            # 0.0 represents the feature mean and is reserved for intentionally unavailable
+            # gated forecast sources.
+            fc_tensor = np.nan_to_num(fc_tensor_raw, nan=0.0)
 
             # Apply explicit input gating: multiply features from shorter-horizon sources
             # by their availability mask, so padded lead times are cleanly zeroed out.
@@ -1404,13 +1574,23 @@ class ForecastDataset(GenericDataset):
                     if forecast_end > target_matrix.shape[0]:
                         continue
 
+                    if not self._is_prediction_window_within_period(
+                        basin=basin,
+                        date_values=date_values,
+                        forecast_end=forecast_end,
+                        predict_last_n=self._predict_last_n[freq_idx]
+                    ):
+                        continue
+
+                    forecast_missing_window = invalid_forecast_nans[
+                        candidate_idx, :self._forecast_seq_len[freq_idx]
+                    ]
+                    if np.any(forecast_missing_window):
+                        continue
+
                     if self.is_train:
                         hindcast_window = hindcast_matrix[hindcast_start:hindcast_end]
                         if np.any(np.isnan(hindcast_window)):
-                            continue
-
-                        forecast_window = fc_tensor[candidate_idx, :self._forecast_seq_len[freq_idx]]
-                        if np.any(np.isnan(forecast_window)):
                             continue
 
                         target_window = target_matrix[hindcast_start:forecast_end]
@@ -1455,12 +1635,6 @@ class ForecastDataset(GenericDataset):
 
                 self._dates[basin][freq] = date_values
                 self._issue_times[basin][freq] = issue_time_values
-
-            # Compute per-basin target std for NSE loss compatibility
-            obs = target_matrix  # shape (T, n_targets)
-            stds = np.nanstd(obs, axis=0)
-            if np.all(np.isfinite(stds)) and np.all(stds > 0):
-                self._per_basin_target_stds[basin] = torch.tensor(stds.reshape(1, -1), dtype=torch.float32)
 
             if not self.is_train:
                 start_dates = self.start_and_end_dates.get(basin, {}).get('start_dates', [])
