@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import json
 from typing import Dict, List, Optional, Tuple
 import logging
 
@@ -162,7 +163,9 @@ class ForecastLoader(ABC):
             8-character hash representing this loader's configuration.
         """
         import hashlib
+        loader_kwargs = json.dumps(self.config.loader_kwargs, sort_keys=True, default=str)
         config_str = (f"{self.config.name}_{self.config.type}_{self.config.suffix}_"
                      f"{','.join(sorted(self.config.variables))}_"
-                     f"{','.join(str(q) for q in sorted(self.config.quartiles))}")
+                     f"{','.join(str(q) for q in sorted(self.config.quartiles))}_"
+                     f"{loader_kwargs}")
         return hashlib.md5(config_str.encode()).hexdigest()[:8]
