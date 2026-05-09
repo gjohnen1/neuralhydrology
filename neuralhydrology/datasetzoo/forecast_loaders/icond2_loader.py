@@ -1,8 +1,11 @@
 """ICON-D2 forecast loader for local high-resolution forecasts."""
 
+import hashlib
 from pathlib import Path
-from typing import Dict, List, Optional
+import warnings
+from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -91,9 +94,131 @@ class ICOND2Loader(ForecastLoader):
         data_dir_name = config.loader_kwargs.get('data_dir', 'icond2')
         self.data_dir = cfg.data_dir / data_dir_name
         self.horizon_hours = config.loader_kwargs.get('horizon_hours', self.HORIZON_HOURS)
+        self.init_time_start = config.loader_kwargs.get('init_time_start',
+                                                       config.loader_kwargs.get('issue_time_start'))
+        self.init_time_end = config.loader_kwargs.get('init_time_end',
+                                                     config.loader_kwargs.get('issue_time_end'))
 
         # Basin-to-catchment mapping (use custom or default)
         self.basin_mapping = config.loader_kwargs.get('basin_mapping', self.DEFAULT_BASIN_MAPPING)
+
+    @property
+    def cache_key(self) -> str:
+        """Include derived ICON-D2 temporal subsetting in the shared cache key."""
+        start, end = self._issue_time_window()
+        config_str = f"{super().cache_key}_{self.horizon_hours}_{start}_{end}"
+        return hashlib.md5(config_str.encode()).hexdigest()[:8]
+
+    @staticmethod
+    def _lead_time_hours(lead_time: xr.DataArray) -> np.ndarray:
+        """Convert ICON-D2 lead_time coordinates to floating point hours."""
+        if np.issubdtype(lead_time.dtype, np.timedelta64):
+            return lead_time.dt.total_seconds().values / 3600.0
+        return lead_time.values.astype(float)
+
+    def _issue_time_window(self) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+        """Return the configured ICON-D2 issue-time window."""
+        start = self.init_time_start
+        end = self.init_time_end
+
+        if start is None or end is None:
+            cfg_values = getattr(self.cfg, '_cfg', {})
+            start_candidates = [
+                cfg_values.get(key) for key in
+                ('train_start_date', 'validation_start_date', 'test_start_date')
+                if cfg_values.get(key) is not None
+            ]
+            end_candidates = [
+                cfg_values.get(key) for key in
+                ('train_end_date', 'validation_end_date', 'test_end_date')
+                if cfg_values.get(key) is not None
+            ]
+
+            if start is None and start_candidates:
+                start = min(pd.to_datetime(value) for value in start_candidates)
+            if end is None and end_candidates:
+                end = max(pd.to_datetime(value) for value in end_candidates)
+
+        start = pd.to_datetime(start) if start is not None else None
+        end = pd.to_datetime(end) if end is not None else None
+        if start is not None and start.tzinfo is not None:
+            start = start.tz_convert(None)
+        if end is not None:
+            if end.tzinfo is not None:
+                end = end.tz_convert(None)
+            end = end + pd.Timedelta(days=1, seconds=-1)
+
+        return start, end
+
+    def _subset_forecast_window(self, ds: xr.Dataset) -> xr.Dataset:
+        """Trim ICON-D2 issue and lead dimensions before loading values."""
+        if 'init_time' in ds.coords:
+            start, end = self._issue_time_window()
+            if start is not None or end is not None:
+                ds = ds.sel(init_time=slice(start, end))
+
+            ds = ds.sel(init_time=ds.init_time.dt.hour == 0)
+
+        if 'lead_time' in ds.coords:
+            lead_hours = self._lead_time_hours(ds['lead_time'])
+            keep_leads = ds['lead_time'].values[lead_hours <= self.horizon_hours]
+            ds = ds.sel(lead_time=keep_leads)
+
+        return ds
+
+    @staticmethod
+    def _quartile_suffix(q: float) -> str:
+        return QuartileComputer.QUARTILE_SUFFIXES.get(q, f'_q{int(q * 100)}')
+
+    def _compute_ensemble_quartiles_fast(self, ds: xr.Dataset) -> xr.Dataset:
+        """Compute ICON-D2 ensemble quartiles with a compact in-memory NumPy path."""
+        if 'ensemble_member' not in ds.dims:
+            return ds
+
+        quartiles = tuple(self.config.quartiles)
+        output_vars = {}
+        coords_to_keep = {
+            name: coord for name, coord in ds.coords.items()
+            if 'ensemble_member' not in coord.dims and name != 'ensemble_member'
+        }
+
+        for var_name, var_data in ds.data_vars.items():
+            if 'ensemble_member' not in var_data.dims:
+                new_var_name = f"{var_name}{self.config.suffix}" if self.config.suffix else var_name
+                output_vars[new_var_name] = var_data.astype(np.float32)
+                continue
+
+            ordered_dims = [dim for dim in var_data.dims if dim != 'ensemble_member'] + ['ensemble_member']
+            var_data = var_data.transpose(*ordered_dims)
+            out_dims = tuple(dim for dim in var_data.dims if dim != 'ensemble_member')
+            values = np.asarray(var_data.values, dtype=np.float32)
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='All-NaN slice encountered')
+                quartile_values = np.nanquantile(
+                    values,
+                    q=np.asarray(quartiles, dtype=np.float32),
+                    axis=-1,
+                    method='linear',
+                ).astype(np.float32, copy=False)
+
+            for idx, q in enumerate(quartiles):
+                new_var_name = f"{var_name}{self.config.suffix}{self._quartile_suffix(q)}"
+                output_vars[new_var_name] = xr.DataArray(
+                    quartile_values[idx],
+                    dims=out_dims,
+                    coords={dim: var_data.coords[dim] for dim in out_dims if dim in var_data.coords},
+                    attrs=var_data.attrs.copy(),
+                )
+
+        quartile_ds = xr.Dataset(
+            data_vars=output_vars,
+            coords=coords_to_keep,
+            attrs=ds.attrs.copy(),
+        )
+        quartile_ds.attrs['quartile_processing'] = f'Computed ICON-D2 quartiles {quartiles} as float32 variables'
+        quartile_ds.attrs['original_ensemble_members'] = int(ds.sizes.get('ensemble_member', 0))
+        return quartile_ds
 
     def load(self, basins: List[str]) -> Optional[xr.Dataset]:
         """Load ICON-D2 forecasts for specified basins.
@@ -223,9 +348,7 @@ class ICOND2Loader(ForecastLoader):
 
         try:
             ds = xr.open_dataset(det_path, decode_timedelta=True)
-
-            # Filter to 00Z initialization only
-            ds = ds.sel(init_time=ds.init_time.dt.hour == 0)
+            ds = self._subset_forecast_window(ds)
 
             # Standardize dimension names
             if 'init_time' in ds.dims:
@@ -281,9 +404,7 @@ class ICOND2Loader(ForecastLoader):
 
         try:
             ds = xr.open_dataset(ens_path, decode_timedelta=True)
-
-            # Filter to 00Z initialization only
-            ds = ds.sel(init_time=ds.init_time.dt.hour == 0)
+            ds = self._subset_forecast_window(ds)
 
             # Filter to requested variables
             available = [v for v in variables if v in ds.data_vars]
@@ -297,11 +418,7 @@ class ICOND2Loader(ForecastLoader):
             ds = self._drop_gauge_id(ds, source_name=ens_path.name)
 
             # Compute quartiles
-            ds_quartiles = QuartileComputer.compute_as_variables(
-                ds,
-                quartiles=tuple(self.config.quartiles),
-                suffix_base=self.config.suffix
-            )
+            ds_quartiles = self._compute_ensemble_quartiles_fast(ds)
 
             # Standardize dimension names
             if 'init_time' in ds_quartiles.dims:
